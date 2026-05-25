@@ -1,0 +1,10 @@
+[project]
+name = "eda"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ruff>=0.15.14",
+    "ty>=0.0.39",
+]
