@@ -9,5 +9,12 @@ wheels/
 # Virtual environments
 .venv
 
-# Ignore the private data file
-data/
+# Ignore everything in the raw data folder
+data/raw/*
+# EXCEPT the .gitkeep file
+!data/raw/.gitkeep
+
+# Ignore everything in the processed data folder
+data/processed/*
+# EXCEPT the .gitkeep file
+!data/processed/.gitkeep
