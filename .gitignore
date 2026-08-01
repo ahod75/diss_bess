@@ -10,15 +10,11 @@ wheels/
 .venv
 
 # Ignore everything in the raw data folder
-data/raw/*
+1_data/raw/*
 # EXCEPT the .gitkeep file
-!data/raw/.gitkeep
+!1_data/raw/.gitkeep
 
-# Ignore everything in the processed data folder
-data/processed/*
+# Might as well keep the processed data in the repo for now, small file, no legal stuff why not
+#1_data/processed/*
 # EXCEPT the .gitkeep file
-!data/processed/.gitkeep
-
-# Ignore other raw dataset folders
-data/unisolar_data/
-data/wpd_comp_data_2021/
+#!1_data/processed/.gitkeep
