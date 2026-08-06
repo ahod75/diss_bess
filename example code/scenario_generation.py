@@ -57,28 +57,72 @@ class PredictiveMarginal:
     monotone CDF (F̂) / inverse-CDF (F̂⁻¹) by piecewise-linear interpolation.
     Used for PIT during estimation and for the non-differentiable eval path."""
 
-    def __init__(self, levels, values, lower=None, upper=None):
+    def __init__(
+            self,
+            levels,
+            values,
+            lower=None,
+            upper=None
+            ):
         levels = np.asarray(levels, float)
-        values = np.maximum.accumulate(np.asarray(values, float))  # non-crossing
-        if lower is None:
-            slope = (values[1] - values[0]) / (levels[1] - levels[0]) if len(levels) > 1 else 0.0
-            lower = values[0] - slope * levels[0]
-        if upper is None:
-            slope = (values[-1] - values[-2]) / (levels[-1] - levels[-2]) if len(levels) > 1 else 0.0
-            upper = values[-1] + slope * (1.0 - levels[-1])
-        self._a = np.concatenate(([0.0], levels, [1.0]))
-        self._v = np.maximum.accumulate(np.concatenate(([lower], values, [upper])))
 
-    def ppf(self, u):
-        u = np.clip(np.asarray(u, float), 0.0, 1.0)
-        return np.interp(u, self._a, self._v)
+        # below not rlly necessary due to softmax + eps in forecaster but doubly ensures monotonicity.
+        values = np.asarray(values, float)
+        assert np.all(np.diff(values) > 0), "ERROR: marginal quantile values are not strictly monotonic!"
+
+        ## Construct all points on the CDF from the forecaster's marginal distribution.
+        
+        ## Step 1: Ensure top and bottom of CDF are defined properly.
+        # remember: probability is y-axis (levels), value is x-axis (values)
+
+        # need to make sure we define a bottom value (x-axis) for every CDF.
+        # if no lower bound defined before:
+        # lower = bottom quantile + slope of bottom two quantiles * difference between 0 and lowest quantile prob
+        if lower is None:
+            slope = (values[1] - values[0]) / (levels[1] - levels[0])
+            lower = values[0] + slope * ( 0 - levels[0])
+        
+        # for upper, same but reverse
+        # upper = top quantile + slope of top two quantiles * difference between 1 and top quantile prob
+        if upper is None:
+            slope = (values[-1] - values[-2]) / (levels[-1] - levels[-2])
+            upper = values[-1] + slope * (1.0 - levels[-1])
+
+        l = np.concatenate(([0.0], levels, [1.0]))
+        v = np.concatenate(([lower], values, [upper]))
+
+        assert np.all(np.diff(l) > 0), "ERROR: appended 0.0 or 1.0 ruined monotonicity of quantile LEVELS (check if levels already contain 0 or 1)"
+        assert np.all(np.diff(v) > 0), "ERROR: extrapolated lower/upper bounds ruined monotonicity of quantile VALUES"
+
+        # define levels and values as instance attributes
+        self._l = l
+        self._v = v
 
     def cdf(self, x):
-        v = self._v.copy()
-        for i in range(1, len(v)):
-            if v[i] <= v[i - 1]:
-                v[i] = v[i - 1] + 1e-12
-        return np.interp(np.asarray(x, float), v, self._a)
+        """
+        linearly interpollated CDF. Takes prosumption input, and returns
+        corresponding CDF probability in [0,1] space.
+        Does this by linearly interpollating CDF based on input discrete quantiles levels and values.
+        """
+        return np.interp(np.asarray(x, float), self._v, self._l)
+
+    def inv_cdf(self, u):
+        """
+        Takes probability from [0,1] space, and returns exact prosumption relating to that CDF probability level
+        Does this by linearly interpolating the cdf based on input discrete quantiles levels and values.
+        """
+    
+        u = np.asarray(u, float)
+    
+        assert np.all((u >= 0.0) & (u <= 1.0)), (
+        f"Probability input 'u' must be between 0.0 and 1.0 inclusive. "
+        f"Got range [{u.min()}, {u.max()}].")
+
+        # originally clipped values, change back if I do actually want to clip them, not generate error.
+        #u = np.clip(np.asarray(u, float), 0.0, 1.0)
+
+        return np.interp(u, self._l, self._v)
+
 
 
 def build_probit_matrix(realisations, quantiles, levels=QUANTILE_LEVELS):

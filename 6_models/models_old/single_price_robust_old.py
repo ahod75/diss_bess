@@ -89,11 +89,6 @@ def _soc_affine(P: Params, v: Vars):
     return s_hat, G
 
 
-## So far, I have done up to here.
-#
-########## TOOOO REPPPLACCEEE!!!!!!!!!!!!!! ###################
-
-
 def _objective(P: Params, v: Vars):
     """Empirical objective (4.2): expectation over the SAMPLE set, not the box."""
 
@@ -142,7 +137,7 @@ def build_robust(P: Params):
     v = _make_vars(P)
     cons = list(v.cons)
     s_hat, G = _soc_affine(P, v)
-
+    
     for t in range(P.T_total):
         d_ch, d_dis = v.D_ch[t, :], v.D_dis[t, :]  # rows = coefficient vectors on xi
         g_t = G[t, :]

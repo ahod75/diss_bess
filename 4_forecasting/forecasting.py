@@ -113,8 +113,7 @@ def build_features(
     out["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
     out["is_weekend"] = is_weekend
     for c in feature_cols:
-        if c in df.columns:
-            out[c] = df[c].astype(float)
+        out[c] = df[c].astype(float)
 
     return out
 
@@ -484,7 +483,7 @@ def pinball_loss(y_true, y_pred, levels):
     # the -1 means that the size of dimension is inferred from other dimensions
     # in this case, since levels is of (Q,) dimensions, q is of the dimensions (1,1,Q)
     # this means q lines up with the error tensor of (B,K,Q)
-    return torch.maximum(q * e, (q - 1.0) * e).mean()  # pinball loss
+    return torch.maximum(q * e, (q - 1.0) * e).sum(dim = (1,2,)).mean()  # pinball loss, summed over all quantiles and averaged over the batch
 
 
 # ============================================================================ #
@@ -552,6 +551,13 @@ if __name__ == "__main__":
                        target_col="prosumption"
                        )
 
+    # grid invariant already enforced inside make_windows; assert the seam:
+    assert Mtr.de == MONTH_TRAIN_END, f"train delivery end {Mtr.de} != {MONTH_TRAIN_END}"
+    # and the shape the model will consume:
+    assert Mtr.x_hist.shape[1:] == (168, len(HIST_COLS))
+    assert Mtr.x_fut.shape[1:]  == (24, len(EXO_COLS))
+    assert Mtr.y.shape[1:]      == (24,)
+
     x_hist_tr = Mtr.x_hist
     x_fut_tr = Mtr.x_fut
     y_tr = Mtr.y
@@ -560,6 +566,8 @@ if __name__ == "__main__":
     ds = Mtr.ds
     de = Mtr.de
 
+
+    
     x_hist_val = Mval.x_hist
     x_fut_val = Mval.x_fut
     y_val = Mval.y
@@ -650,7 +658,7 @@ if __name__ == "__main__":
     print("min increment:", float(diffs.min()))
 
     q_mw = denormalise_y(q_va, sc)
-    assert np.all(np.diff(q_mw.numpy(), axis=-1) > 0), (
+    assert np.all(np.diff(q_mw.numpy(), axis=-1) >= 0), (
         "physical-unit quantiles must stay ordered"
     )
     print("monotone after inverse-standardise: True")
