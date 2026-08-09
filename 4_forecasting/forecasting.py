@@ -87,6 +87,7 @@ def build_features(
     df: pd.DataFrame,
     prosumption_col: str = "prosumption",
     feature_cols: list[str] = ["solar_irrad", "panel_temp", "ambient_temp"],
+    price_cols: list[str] = ["da", "imb", "up_reg_cost", "down_reg_cost"]
 ) -> pd.DataFrame:
     """
     df: DatetimeIndex (hourly), columns = [load_col, *feature_cols].
@@ -114,6 +115,8 @@ def build_features(
     out["is_weekend"] = is_weekend
     for c in feature_cols:
         out[c] = df[c].astype(float)
+    for d in price_cols:
+        out[d] = df[d].astype(float)
 
     return out
 

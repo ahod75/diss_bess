@@ -45,17 +45,46 @@ class FixedParams:
     p_min: float          # DA bid lower bound (MW) -- FIXED across all windows & corners
     p_max: float          # DA bid upper bound (MW) -- FIXED across all windows & corners
     k: float              # 0 = profit-max, 1 = max-dispatchable  (use {0,1} only)
-    gamma: float = 1e-4   # Tikhonov coefficient (uniqueness / KKT-invertibility)
+    gamma: float = 1e-6   # Tikhonov coefficient (uniqueness / KKT-invertibility)
 
 
-def default_fixed_params(k: float, num_scenarios: int = 64, gamma = 1e-4) -> FixedParams:
+def default_fixed_params(k: float, num_scenarios: int = 64, gamma = 1e-6) -> FixedParams:
     """The pinned physical configuration for this dissertation."""
     assert k in (0.0, 1.0), "this study uses k in {0, 1} only"
     return FixedParams(
         T_total=24, num_scenarios=num_scenarios, dt=1.0,
         eta_ch=0.95, eta_dis=0.95, C_ch=2.0, C_dis=2.0, B_max=4.0, SOC0=2.0,
-        p_min=-5.0, p_max=8.0, k=float(k), gamma=gamma,
+        p_min=-5.0, p_max=11.0, k=float(k), gamma=gamma,
     )
+
+
+# -------------------------------------------------------------------------------------
+# Robustification helper (unchanged from the reference; the free bid does NOT enter any
+# robust constraint -- p_da_rel appears only in the objective and its own box).
+#
+# Robustifies, row-wise for t in T:   A0_t + (A xi)_t <= B   for all xi in Xi' = {xi : H xi <= h},
+# with H = [I; -I], h = [h_plus; h_minus]  (i.e. -h_minus <= xi <= h_plus, componentwise).
+# LP-duality counterpart:  exists mu_p, mu_m >= 0 with  mu_p - mu_m = A  and
+#                          mu_p h_plus + mu_m h_minus <= B - A0.
+# -------------------------------------------------------------------------------------
+
+## Vectorising the function that creates the dual variables makes it build the model much quicker.
+def _robustify_vec(A0, A, B, T, h_plus, h_minus):
+    """
+    Vectorized robustification.
+    A0: (T,) expression
+    A: (T, T) expression
+    B: scalar
+    """
+    # Create (T, T) variables instead of looping to create T variables of size T
+    mu_p = cp.Variable((T, T), nonneg=True)
+    mu_m = cp.Variable((T, T), nonneg=True)
+
+    return [
+        mu_p - mu_m == A,  # Evaluates equality for the entire (T,T) matrix
+        # (T,T) @ (T,) yields a (T,) vector of dot products for each time step
+        mu_p @ h_plus + mu_m @ h_minus <= B - A0,
+    ]
 
 # Used to create the cvxpylayers layer.
 @dataclass
@@ -86,24 +115,16 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
     # NOTE: the objective-function-dependent parameters are defined further down,
     # where the objective function is defined.
     pl_hat  = cp.Parameter(T, name="pl_hat")         # mean forecast (bid bounds only; see note)
+    h_plus  = cp.Parameter(T, nonneg=True, name="h_plus")
+    h_minus = cp.Parameter(T, nonneg=True, name="h_minus")
+
     cons = []
     # LDR non-anticipativity: D lower-triangular (D_{t,tau}=0 for tau>t).
     cons += [cp.upper_tri(D_ch) == 0, cp.upper_tri(D_dis) == 0]
 
 
         ## MAKE SOC EQUATION
-    # Notes on Robustifying:
-    # Originally the plan was to use the full robust LDR formulation used by stratigakos et al.
-    # However, when it came to running the problem with the sheer number of variables introduced
-    # by robustifying over all time steps for all battery constraints, a single solve took a very 
-    # long time.
-    # For this reason, robustification has been removed for the main code, and is only there as
-    # reference.
-    
-
-    ### NOTES ON PROBLEM FORMULATION
-    # NOTE: This explanation was used to explain how robust formulation was reached,
-    # but it's still valid for non-robust.
+    ### NOTES ON ROBUSTIFYING PROBLEM FORMULATION
     # To robustify the constraints of the model, we need to separate the random variable \xi
     # from the rest of the model.
     # To do this, we can represent the total SOC function as an affine function.
@@ -135,8 +156,22 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
     D_net = fp.eta_ch * D_ch - (1.0 / fp.eta_dis) * D_dis
     G = dt * cp.cumsum(D_net, axis=0)                              # (T,T) recourse SOC gain
 
-    # --- NON-robust SOC constraints
+    # --- VECTORIZED SOC CONSTRAINTS (Replaces the for-loop) ---
 
+
+    # (1)(2) Charge rate: 0 <= p_ch_t(xi) <= C_ch
+    cons += _robustify_vec( p_ch_hat,  D_ch, fp.C_ch,           T, h_plus, h_minus)
+    cons += _robustify_vec(-p_ch_hat, -D_ch, 0.0,               T, h_plus, h_minus)
+
+    # (3)(4) Discharge rate: 0 <= p_dis_t(xi) <= C_dis
+    cons += _robustify_vec( p_dis_hat,  D_dis, fp.C_dis,           T, h_plus, h_minus)
+    cons += _robustify_vec(-p_dis_hat, -D_dis, 0.0,                T, h_plus, h_minus)
+
+    # (5)(6) State of Charge: 0 <= s_t(xi) <= B_max
+    cons += _robustify_vec( s_hat,  G, fp.B_max,           T, h_plus, h_minus)
+    cons += _robustify_vec(-s_hat, -G, 0.0,                T, h_plus, h_minus)
+    
+    """
     # (1)(2) Charge rate: 0 <= p_ch_hat <= C_ch
     cons += [p_ch_hat >= 0, p_ch_hat <= fp.C_ch]
 
@@ -145,7 +180,8 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
 
     # (5)(6) State of Charge: 0 <= s_hat <= B_max
     cons += [s_hat >= 0, s_hat <= fp.B_max]
-    
+    """
+
     # terminal equality. Outside for loop.
     cons += [
         s_hat[T - 1] == fp.SOC0,  # s_hat = SOC0
@@ -170,14 +206,6 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
     # where the coefficients (like A and b) are strictly affine functions of the parameters. 
     # Multiplying a cp.Parameter by another cp.Parameter creates a non-linear (quadratic or bilinear) parameter dependence, which CVXPY cannot factorize.
     # """
-
-    # ============================ Instantiate xi_samples (dual economic epigraph only)===
-    # k>0's tracking term uses Sigma_xi_chol instead (below) -- (T,T)-sized SOC term,
-    # ~24x faster to solve than the equivalent (T,N)-sized xi_samples term, empirically
-    # measured this session (8.5s -> 0.35s median per solve, single/k=1).
-    if fp.k < 1.0 and price_model == "dual":
-        xi_samples = cp.Parameter((N, T), name="xi_samples")
-        params.append(xi_samples)
 
     # ============================ ECONOMIC TERM  (only if (1-k) > 0) ===============
     
@@ -216,9 +244,10 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
             # Then, we need to make sure that the epigraph is valid for all scenarios by adding the constraints.
 
             # DUAL no-arbitrage penalty via epigraph split (DPP-clean, removes the kink).
+            xi_samples = cp.Parameter((N, T), name="xi_samples")
             lam_up     = cp.Parameter(T, nonneg=True, name="lam_up")
             lam_dn     = cp.Parameter(T, nonneg=True, name="lam_dn")
-            params += [lam_up, lam_dn]
+            params += [xi_samples, lam_up, lam_dn]
             p_plus  = cp.Variable((T, N), nonneg=True, name="p_plus")
             p_minus = cp.Variable((T, N), nonneg=True, name="p_minus")
 
@@ -234,7 +263,7 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
 
     # ============================ TRACKING TERM  (only if k > 0) ===================
     if fp.k > 0.0:
-
+        
         # To maintain DPP in this problem, I have to make sure I don't multiply any parameters by any parameters.
         # This means I can't multiply p_imb by itself as I defined originally in my equations, as p_imb contained xi_samples, a PARAMETER.
         # To get around this, I can reformulate the quadratic part of the equation using the Georghiou et. al. paper original LDR paper.
@@ -242,15 +271,11 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
         # where r_t is the t'th row of the recouse matrix, Sigma_xi is the second moment of xi_samples.
         # This would be:
         # sum_trace = fixed_params.dt**2 * (cp.sum_squares(imb_det) + (sum(cp.quad_form(R[t, :], Sigma_xi) for t in range(T))
-        # HOWEVER: cvxpy doesn't like that formulation and it wouldn't be DPP, so instead do it
-        # via the Cholesky factor and sum_squares: sum_squares(R @ Chol) == trace(R Sigma_xi R^T)
-        # when Chol.Chol^T == Sigma_xi (== xi^T xi / N), by the trace identity -- IDENTICAL
-        # value to the xi_samples-direct formulation below, but over a (T,T) SOC term instead
-        # of (T,N), ~24x faster to solve empirically. Chol MUST be built via a differentiable
-        # path (torch.linalg.cholesky) -- see dispatch_wrapper.cholesky_of_second_moment. An
-        # earlier attempt built it via detached numpy (xi.detach().cpu().numpy() +
-        # np.linalg.cholesky), which silently zeroed the tracking-term gradient back to the
-        # forecaster; that's why this was shelved as "a bad idea" previously.
+        # HOWEVER:
+        # apparently cvxpy doesn't like that formulation and it wouldn't be DPP, so I have to do it using the cholesky factor and using sum_squares.
+        
+        tracking_scale = cp.Parameter(nonneg=True, name="tracking_scale")
+
         Sigma_xi_chol = cp.Parameter((T, T), name="Sigma_xi_chol")
         params.append(Sigma_xi_chol)
         sum_trace = dt**2 * (cp.sum_squares(imb_det) + cp.sum_squares(R @ Sigma_xi_chol))
@@ -261,8 +286,12 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
         cp.sum_squares(p_ch_hat) + cp.sum_squares(p_dis_hat)
         + cp.sum_squares(D_ch) + cp.sum_squares(D_dis)
         + cp.sum_squares(p_da_rel)          # NEW: bid needs its own reg (uniqueness at k=0)
+        
     )
     obj_terms.append(penalty)
+
+    # trailing box params (stable order)
+    params += [h_plus, h_minus]
 
     prob = cp.Problem(cp.Minimize(sum(obj_terms)), cons)
     assert prob.is_dcp(dpp=True), "not DPP -- cvxpylayers will reject"
@@ -423,9 +452,9 @@ def solve_oracle(bundle: OracleBundle, values: dict, solver=cp.GUROBI,
 # Symmetrise + jitter before Cholesky (cheap insurance vs intermittent LinAlgError).
 # N here MUST equal the model's N (one draw -> one mean -> pl_hat, h, xi, M all share it).
 # -------------------------------------------------------------------------------------
-#def cholesky_of_second_moment(xi: np.ndarray, jitter: float = 1e-9) -> np.ndarray:
-#    xi = np.asarray(xi, dtype=float)              # (N, T), mean-centred
-#    N, T = xi.shape
-#    M = xi.T @ xi / N
-#    M = 0.5 * (M + M.T) + jitter * np.eye(T)
-#    return np.linalg.cholesky(M)                  # lower L with L L^T = M
+def cholesky_of_second_moment(xi: np.ndarray, jitter: float = 1e-9) -> np.ndarray:
+    xi = np.asarray(xi, dtype=float)              # (N, T), mean-centred
+    N, T = xi.shape
+    M = xi.T @ xi / N
+    M = 0.5 * (M + M.T) + jitter * np.eye(T)
+    return np.linalg.cholesky(M)                  # lower L with L L^T = M
