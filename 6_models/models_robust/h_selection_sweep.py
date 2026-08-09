@@ -38,15 +38,18 @@ FORECASTING_DIR = ROOT_DIR / "4_forecasting"
 DATA_DIR = ROOT_DIR / "1_data" / "processed"
 COPULA_DIR = ROOT_DIR / "5_scenario_gen"
 MODEL_DIR = ROOT_DIR / "6_models"
+MODELS_ROBUST_DIR = MODEL_DIR / "models_robust"
 
 sys.path.insert(0, str(FORECASTING_DIR))  # make forecasting module importable
 sys.path.insert(0, str(COPULA_DIR))  # make copula module importable
 sys.path.insert(0, str(MODEL_DIR))  # make model modules importable
+sys.path.insert(0, str(MODELS_ROBUST_DIR))  # make dispatch_layer_robust/dispatch_wrapper_robust importable
 
-from dispatch_layer import default_fixed_params, build_problem, solve_plain
-from dispatch_wrapper import get_prices, realised_breakdown, cholesky_of_second_moment
+from dispatch_layer_robust import default_fixed_params, build_problem, solve_plain
+from dispatch_wrapper_robust import get_prices, realised_breakdown, cholesky_of_second_moment
 from forecasting import (reindex_and_impute, build_features, make_windows,
-                             normalise_hist, denormalise_y, Baseline_Forecaster)
+                             normalise_hist, normalise_exo, denormalise_y, Baseline_Forecaster,
+                             HIST_COLS, FEAT_COLS, EXO_COLS)
 from copula_lib import FrozenCopulaSampler
 
 # ------------------------------------------------------------------ CONFIG
@@ -56,7 +59,7 @@ CORNERS = [("single", 0.0), ("single", 1.0), ("dual", 0.0), ("dual", 1.0)]
 N_SCEN = 64
 DT = 1.0
 MIN_BOX = 1e-4
-SOLVER = cp.CLARABEL                     # plain solve; Gurobi also fine
+SOLVER = cp.GUROBI                       # plain solve; significantly faster than Clarabel
 SAT_TOL = 1e-6
 
 # split boundaries (UTC); 2018 delivery blocks fully inside [TRAIN_START, VAL_START - 1h]
@@ -66,9 +69,6 @@ ISSUE_HOUR  = 9
 HORIZON     = 24
 N_HIST      = 168                        # <-- set to your forecaster's lookback
 
-HIST_COLS = ["prosumption", "solar_irrad", "panel_temp", "ambient_temp"]
-FEAT_COLS = ["solar_irrad", "panel_temp", "ambient_temp"]
-EXO_COLS  = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "doy_sin", "doy_cos", "is_weekend"]
 PRICE_COLS = ["da", "imb", "up_reg_cost", "down_reg_cost"]
 
 
@@ -84,7 +84,8 @@ def make_forecast_fn(model, scaler_stats, device, normalise_hist, denormalise_y)
         with torch.no_grad():
             xh = normalise_hist(np.asarray(x_hist_day), scaler_stats)      # (n_hist, C_hist)
             xh = torch.as_tensor(xh, dtype=torch.float32, device=device).unsqueeze(0)
-            xf = torch.as_tensor(np.asarray(x_fut_day), dtype=torch.float32, device=device).unsqueeze(0)
+            xf = normalise_exo(np.asarray(x_fut_day), scaler_stats)
+            xf = torch.as_tensor(xf, dtype=torch.float32, device=device).unsqueeze(0)
             q_norm = model(xh, xf)                                          # (1, K, Q) normalised
             q_phys = denormalise_y(q_norm, scaler_stats)                    # affine -> physical MW
         return q_phys.squeeze(0).to(torch.float64)                         # (K, Q)
@@ -242,7 +243,9 @@ if __name__ == "__main__":
     forecast_fn = make_forecast_fn(model, sc, DEVICE, normalise_hist, denormalise_y)
 
     per_day, yearly = run_sweep(windows, forecast_fn, sampler, QUANTILE_LEVELS)
-    per_day.to_csv("h_sweep_per_day_2018.csv", index=False)
-    yearly.to_csv("h_sweep_yearly_2018.csv", index=False)
+    per_day_path = MODELS_ROBUST_DIR / "h_sweep_per_day_2018.csv"
+    yearly_path = MODELS_ROBUST_DIR / "h_sweep_yearly_2018.csv"
+    per_day.to_csv(per_day_path, index=False)
+    yearly.to_csv(yearly_path, index=False)
     print(yearly.to_string(index=False))
-    print("\nsaved: h_sweep_per_day_2018.csv (per-day), h_sweep_yearly_2018.csv (yearly aggregate)")
+    print(f"\nsaved: {per_day_path} (per-day), {yearly_path} (yearly aggregate)")

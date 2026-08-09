@@ -283,8 +283,9 @@ def per_day_metrics(fp: FixedParams, bd: RealisedBreakdown, oracle_cost: float) 
 
 
 # -------------------------------------------------------------------------------------
-# MONEY-PLOT SERIES (per representative day). The bid/p^g gap against the fixed bounds
-# IS the single-vs-dual story; the price panel is what makes the bid behaviour readable.
+# MONEY-PLOT SERIES (per representative day). The bid/p^g gap (bid is now pinned to
+# pl_hat + p_ch_hat - p_dis_hat, not bounded arbitrage) is the single-vs-dual story;
+# the price panel is what makes the bid behaviour readable.
 # -------------------------------------------------------------------------------------
 def money_plot_series(fp, bd: RealisedBreakdown, price_model,
                       pi_da, pi_imb=None, lam_up=None, lam_dn=None) -> dict:
@@ -296,7 +297,6 @@ def money_plot_series(fp, bd: RealisedBreakdown, price_model,
         "soc":    to_np(bd.soc),
         "p_ch_r": to_np(bd.p_ch_r),
         "p_dis_r": to_np(bd.p_dis_r),
-        "p_min":  fp.p_min, "p_max": fp.p_max,
         "pi_da":  np.asarray(pi_da, float),
     }
     if price_model == "single":

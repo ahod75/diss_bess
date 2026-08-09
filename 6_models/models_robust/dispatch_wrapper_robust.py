@@ -4,7 +4,7 @@ import warnings
 import numpy as np
 import torch
 
-from dispatch_layer import FixedParams, cholesky_of_second_moment
+from dispatch_layer_robust import FixedParams, cholesky_of_second_moment
 
 # =====================================================================================
 # dispatch_wrapper.py  --  the realised-metric ENGINE and the input builder.
@@ -83,9 +83,15 @@ def _to_t(x, like: torch.Tensor | None = None) -> torch.Tensor:
 # BOX (B1): half-widths in xi = (realised - mean) coordinate, from the frozen BASELINE
 # forecaster's quantiles. Computed ONCE per test day, cached, and passed VERBATIM to
 # every (price_model, k) instance -> identical robust feasible set in xi-space.
+#
+# box_levels default = (0.15, 0.85), locked in from h_selection_sweep.py /
+# h_selection_sweep_point.py's comparison (see h_selection_sweep.ipynb): dominates the
+# previously-used (0.20, 0.80) on both the full LP-dual robust model and the
+# point-constrained training surrogate (near-identical control-action cost, meaningfully
+# lower saturation on both) -- verified on 2018 training-period data, both price models.
 # -------------------------------------------------------------------------------------
 def compute_box(baseline_quantiles, sampler, quantile_levels,
-                box_levels=(0.05, 0.95), min_box=1e-4):
+                box_levels=(0.15, 0.85), min_box=1e-4):
     """B1 frozen box from the BASELINE forecaster, for ONE day.
 
     baseline_quantiles: (K, Q) from the frozen reference (128) model, physical MW.
@@ -297,8 +303,9 @@ def per_day_metrics(fp: FixedParams, bd: RealisedBreakdown, oracle_cost: float) 
 
 
 # -------------------------------------------------------------------------------------
-# MONEY-PLOT SERIES (per representative day). The bid/p^g gap against the fixed bounds
-# IS the single-vs-dual story; the price panel is what makes the bid behaviour readable.
+# MONEY-PLOT SERIES (per representative day). The bid/p^g gap (bid is now pinned to
+# pl_hat + p_ch_hat - p_dis_hat, not bounded arbitrage) is the single-vs-dual story;
+# the price panel is what makes the bid behaviour readable.
 # -------------------------------------------------------------------------------------
 def money_plot_series(fp, bd: RealisedBreakdown, price_model,
                       pi_da, pi_imb=None, lam_up=None, lam_dn=None) -> dict:
@@ -310,7 +317,6 @@ def money_plot_series(fp, bd: RealisedBreakdown, price_model,
         "soc":    to_np(bd.soc),
         "p_ch_r": to_np(bd.p_ch_r),
         "p_dis_r": to_np(bd.p_dis_r),
-        "p_min":  fp.p_min, "p_max": fp.p_max,
         "pi_da":  np.asarray(pi_da, float),
     }
     if price_model == "single":

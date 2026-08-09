@@ -41,17 +41,15 @@ sys.path.insert(0, str(COPULA_DIR))
 sys.path.insert(0, str(MODEL_DIR))
 
 from forecasting import (reindex_and_impute, build_features, make_windows,
-                         normalise_hist, denormalise_y, Baseline_Forecaster,
-                         QUANTILE_LEVELS, TEST_START, TEST_END)
+                         normalise_hist, normalise_exo, denormalise_y, Baseline_Forecaster,
+                         QUANTILE_LEVELS, TEST_START, TEST_END,
+                         HIST_COLS, FEAT_COLS, EXO_COLS)
 from copula_lib import FrozenCopulaSampler
 from dispatch_layer import (default_fixed_params, build_problem, solve_plain,
                             build_oracle, solve_oracle)
 from dispatch_wrapper import (get_prices, oracle_price_values, realised_breakdown, per_day_metrics,
                               cholesky_of_second_moment)
 
-HIST_COLS  = ["prosumption", "solar_irrad", "panel_temp", "ambient_temp"]
-FEAT_COLS  = ["solar_irrad", "panel_temp", "ambient_temp"]
-EXO_COLS   = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "doy_sin", "doy_cos", "is_weekend"]
 PRICE_COLS = ["da", "imb", "up_reg_cost", "down_reg_cost"]
 ISSUE_HOUR, HORIZON, N_HIST = 9, 24, 168
 device = torch.device("cpu")   # plain Gurobi solve; forecast forward pass is cheap on CPU too
@@ -76,7 +74,8 @@ def forecast_quantiles(model, sc, x_hist_day, x_fut_day):
     with torch.no_grad():
         xh = normalise_hist(np.asarray(x_hist_day), sc)
         xh = torch.as_tensor(xh, dtype=torch.float32, device=device).unsqueeze(0)
-        xf = torch.as_tensor(np.asarray(x_fut_day), dtype=torch.float32, device=device).unsqueeze(0)
+        xf = normalise_exo(np.asarray(x_fut_day), sc)
+        xf = torch.as_tensor(xf, dtype=torch.float32, device=device).unsqueeze(0)
         q_norm = model(xh, xf)
         q_phys = denormalise_y(q_norm, sc)
     return q_phys.squeeze(0).to(torch.float64)

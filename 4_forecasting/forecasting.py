@@ -54,6 +54,8 @@ EXO_COLS = [
     "doy_sin",
     "doy_cos",
     "is_weekend",
+    "solar_irrad",
+    "ambient_temp",
 ]
 
 DEFAULT_MODEL_CONFIG = {
@@ -276,12 +278,15 @@ def make_windows(
 # ============================================================================ #
 # Section 4 — normalisation
 # ============================================================================ #
-def fit_scalers(frame_slice, hist_cols, target_col="prosumption"):
+def fit_scalers(frame_slice, hist_cols, target_col="prosumption", exo_cols=None):
     """
     frame_slice : raw rows the TRAINING windows touch, e.g. frame.loc[hs:de]
                   (each hour counted once — no window double-counting).
     hist_cols   : channel order of x_hist, e.g.
                   ["prosumption", "irradiance_Wm-2", "panel_temp_C", "temp_location3"]
+    exo_cols    : channel order of x_fut, e.g. EXO_COLS. Optional so old checkpoints'
+                  scaler dicts (fit before exo normalisation existed) still load; when
+                  omitted, normalise_exo is a no-op (mu=0, sd=1) rather than erroring.
     Returns a dict of frozen stats.
     """
     mu_hist = np.array([frame_slice[c].mean() for c in hist_cols], dtype=np.float32)
@@ -290,18 +295,48 @@ def fit_scalers(frame_slice, hist_cols, target_col="prosumption"):
     # target shares the prosumption series -> same scaler (computed from same column)
     mu_y = float(frame_slice[target_col].mean())
     sd_y = float(frame_slice[target_col].std() or 1.0)
-    return {
+    out = {
         "hist_cols": list(hist_cols),
         "mu_hist": mu_hist,
         "sd_hist": sd_hist,
         "mu_y": mu_y,
         "sd_y": sd_y,
     }
+    if exo_cols:
+        # Exo columns that ALSO appear in hist_cols (solar_irrad, ambient_temp -- the raw
+        # physical-unit weather channels) reuse that EXACT same mu/sd, so the model sees
+        # the identical normalisation for a quantity whether it's past (hist) or future
+        # (exo) weather -- no separate exo-only scaler is fit for these. Exo columns with
+        # no hist_cols counterpart (hour_sin, dow_cos, is_weekend, ...) are cyclical/binary
+        # calendar features already appropriately scaled; they get mu=0, sd=1 (identity) --
+        # z-scoring sin/cos pairs independently would give each an empirically-different
+        # mu/sd from real (non-uniform) training data and break the sin^2+cos^2=1 circular
+        # pairing the cyclical encoding exists for.
+        hist_index = {c: i for i, c in enumerate(hist_cols)}
+        mu_exo = np.array([mu_hist[hist_index[c]] if c in hist_index else 0.0
+                            for c in exo_cols], dtype=np.float32)
+        sd_exo = np.array([sd_hist[hist_index[c]] if c in hist_index else 1.0
+                            for c in exo_cols], dtype=np.float32)
+        out["exo_cols"] = list(exo_cols)
+        out["mu_exo"] = mu_exo
+        out["sd_exo"] = sd_exo
+    return out
 
 
 def normalise_hist(x_hist, scalers):
     """x_hist: (N, L, C) aligned to scalers['hist_cols']. Per-channel z-score."""
     return ((x_hist - scalers["mu_hist"]) / scalers["sd_hist"]).astype(np.float32)
+
+
+def normalise_exo(x_exo, scalers):
+    """x_exo: (N, horizon, F_exo) aligned to scalers['exo_cols']. Per-channel z-score,
+    where mu_exo/sd_exo (built in fit_scalers) are the SAME stats as the matching
+    hist_cols channel for solar_irrad/ambient_temp, and identity (mu=0, sd=1) for the
+    cyclical/binary calendar columns that shouldn't be touched (see fit_scalers).
+    Falls back to a no-op if scalers has no exo stats (checkpoints fit before this existed)."""
+    if "mu_exo" not in scalers:
+        return np.asarray(x_exo, dtype=np.float32)
+    return ((x_exo - scalers["mu_exo"]) / scalers["sd_exo"]).astype(np.float32)
 
 
 def normalise_y(y, scalers):
@@ -577,7 +612,7 @@ if __name__ == "__main__":
 
     # --- fit scalers on the training span + normalise --------------- (cell 20) --
     hist_cols = HIST_COLS
-    sc = fit_scalers(frame_full.loc[hs:de], hist_cols)
+    sc = fit_scalers(frame_full.loc[hs:de], hist_cols, exo_cols=EXO_COLS)
 
     print(
         "mu_hist:", np.round(sc["mu_hist"], 2), "sd_hist:", np.round(sc["sd_hist"], 2)
@@ -593,6 +628,8 @@ if __name__ == "__main__":
     y_n = normalise_y(y_tr, sc)
     xh_val_n = normalise_hist(x_hist_val, sc)
     y_val_n = normalise_y(y_val, sc)
+    x_fut_tr = normalise_exo(x_fut_tr, sc)
+    x_fut_val = normalise_exo(x_fut_val, sc)
     print(
         "normalised hist ch0  mean/std:",
         round(xh_n[:, :, 0].mean(), 3),

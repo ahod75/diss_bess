@@ -5,7 +5,7 @@ import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 
 # =====================================================================================
-# dispatch_layer.py  --  FREE-BID robust LDR dispatch, single- & dual-price objectives.
+# dispatch_layer.py  --  PINNED-BID robust LDR dispatch, single- & dual-price objectives.
 #
 # THREE FORMULATIONS, ONE CONSTRUCTOR:
 #   * build_problem(fp, price_model)  -> ProblemBundle   (the shared skeleton)
@@ -15,16 +15,20 @@ from cvxpylayers.torch import CvxpyLayer
 #   * build_oracle(fp, price_model)   -> OracleBundle     (perfect-foresight, Gurobi, N/A)
 #
 # The ONLY thing that differs single-vs-dual is the imbalance block; everything else
-# (variables, SOC, robust box, tracking, penalty, bid bounds) is shared verbatim.
+# (variables, SOC, robust box, tracking, penalty) is shared verbatim.
 #
-# KEY DIFFERENCE FROM THE OLD (tied) REFERENCE CODE:
-#   The bid p^{da} is now a FREE variable (Stratigakos-style), reparametrised as
-#       p_da_rel = p^{da} - pl_hat           (variable-only, keeps sum_squares(imb_det) DPP)
-#   so the deterministic imbalance offset is
-#       imb_det = (p_hat_ch - p_hat_dis - p_da_rel)          [ = g_hat - p^{da} ]
-#   and the realised imbalance is
-#       p_imb(xi) = imb_det + R xi ,   R = I + D_ch - D_dis .
-#   The DA cost drops the constant  pi_da . pl_hat . dt  (added back DOWNSTREAM).
+# BID: pinned to p^{da} = pl_hat + p_ch_hat - p_dis_hat (matches
+# models_old/single_price_robust_old.py's original formulation -- no independent bid
+# variable). p_da_rel is kept as a pure-variable DPP stand-in for (p^{da} - pl_hat), so
+# C_da = pi_da @ p_da_rel * dt doesn't multiply pi_da by a pl_hat-containing expression
+# (not DPP) -- but it's constrained to p_ch_hat - p_dis_hat rather than left free. A free
+# p_da_rel let the solver arbitrage the known pi_da/pi_imb spread independently of the
+# forecast (measured: bid saturated to a bound every hour, regret ~0 regardless of
+# forecast quality). Pinned, the deterministic imbalance offset
+#       imb_det = (p_hat_ch - p_hat_dis - p_da_rel)  =  0  identically
+# and the realised imbalance is purely recourse-driven:
+#       p_imb(xi) = R xi ,   R = I + D_ch - D_dis .
+# The DA cost drops the constant  pi_da . pl_hat . dt  (added back DOWNSTREAM).
 # =====================================================================================
 
 
@@ -42,8 +46,6 @@ class FixedParams:
     C_dis: float          # max discharge rate (MW, grid-side)
     B_max: float          # battery energy capacity (MWh)
     SOC0: float           # initial == terminal state of charge (MWh)
-    p_min: float          # DA bid lower bound (MW) -- FIXED across all windows & corners
-    p_max: float          # DA bid upper bound (MW) -- FIXED across all windows & corners
     k: float              # 0 = profit-max, 1 = max-dispatchable  (use {0,1} only)
     gamma: float = 1e-6   # Tikhonov coefficient (uniqueness / KKT-invertibility)
 
@@ -54,13 +56,13 @@ def default_fixed_params(k: float, num_scenarios: int = 64, gamma = 1e-6) -> Fix
     return FixedParams(
         T_total=24, num_scenarios=num_scenarios, dt=1.0,
         eta_ch=0.95, eta_dis=0.95, C_ch=2.0, C_dis=2.0, B_max=4.0, SOC0=2.0,
-        p_min=-5.0, p_max=11.0, k=float(k), gamma=gamma,
+        k=float(k), gamma=gamma,
     )
 
 
 # -------------------------------------------------------------------------------------
-# Robustification helper (unchanged from the reference; the free bid does NOT enter any
-# robust constraint -- p_da_rel appears only in the objective and its own box).
+# Robustification helper (unchanged from the reference; the pinned bid does NOT enter
+# any robust constraint -- p_da_rel appears only in the objective, via imb_det = 0).
 #
 # Robustifies, row-wise for t in T:   A0_t + (A xi)_t <= B   for all xi in Xi' = {xi : H xi <= h},
 # with H = [I; -I], h = [h_plus; h_minus]  (i.e. -h_minus <= xi <= h_plus, componentwise).
@@ -109,12 +111,18 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
     p_dis_hat = cp.Variable(T, name="p_dis_hat")
     D_ch      = cp.Variable((T, T), name="D_ch")
     D_dis     = cp.Variable((T, T), name="D_dis")
-    p_da_rel  = cp.Variable(T, name="p_da_rel")      # FREE bid, reparametrised (= p_da - pl_hat)
+    # p_da_rel: pure-variable DPP stand-in for (p_da - pl_hat), PINNED below to
+    # p_ch_hat - p_dis_hat (matches models_old/single_price_robust_old.py's
+    # p_bid = pl_hat + p_ch_hat - p_dis_hat). Left free it lets the solver arbitrage
+    # the known pi_da/pi_imb spread independently of the forecast -- see the matching
+    # note in dispatch_layer.py/dispatch_layer_1stage.py. Pinned, the bid is bounded
+    # automatically by p_ch_hat/p_dis_hat's own physical limits.
+    p_da_rel  = cp.Variable(T, name="p_da_rel")
 
     # ---- always-present parameters ----------------------------------------------
-    # NOTE: the objective-function-dependent parameters are defined further down,
-    # where the objective function is defined.
-    pl_hat  = cp.Parameter(T, name="pl_hat")         # mean forecast (bid bounds only; see note)
+    # NOTE: pl_hat is NOT a cvxpy Parameter here -- with the bid pinned, the forecast
+    # never enters this optimization problem; it only matters downstream in
+    # realised_cost/realised_breakdown. See the matching note in dispatch_layer.py.
     h_plus  = cp.Parameter(T, nonneg=True, name="h_plus")
     h_minus = cp.Parameter(T, nonneg=True, name="h_minus")
 
@@ -189,14 +197,14 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
     ]  # g_T = 0 : recourse is energy-neutral
 
 
-    # ---- bid bounds (deterministic; p^{da} = p_da_rel + pl_hat) -------------------
-    cons += [p_da_rel + pl_hat >= fp.p_min, p_da_rel + pl_hat <= fp.p_max]
+    # ---- bid: PINNED (p^{da} = pl_hat + p_ch_hat - p_dis_hat), no separate bound needed --
+    cons += [p_da_rel == p_ch_hat - p_dis_hat]
 
     # ---- shared imbalance building blocks ----------------------------------------
     imb_det = p_ch_hat - p_dis_hat - p_da_rel          # (T,) variable-only; = g_hat - p^{da}
     R = np.eye(T) + D_ch - D_dis                      # (T,T) recourse matrix
 
-    params = [pl_hat]
+    params = []
     obj_terms = []
 
     ## The major ball ache: DPP COMPLIANCE
@@ -281,12 +289,12 @@ def build_problem(fp: FixedParams, price_model: str) -> ProblemBundle:
         sum_trace = dt**2 * (cp.sum_squares(imb_det) + cp.sum_squares(R @ Sigma_xi_chol))
         obj_terms.append(fp.k * sum_trace)
 
-    # ============================ PENALTY  (always; includes the free bid) =========
+    # ============================ PENALTY  (always) =================================
+    # p_da_rel no longer needs its own reg term -- it's pinned to p_ch_hat - p_dis_hat,
+    # so their sum_squares terms already cover it.
     penalty = fp.gamma * (
         cp.sum_squares(p_ch_hat) + cp.sum_squares(p_dis_hat)
         + cp.sum_squares(D_ch) + cp.sum_squares(D_dis)
-        + cp.sum_squares(p_da_rel)          # NEW: bid needs its own reg (uniqueness at k=0)
-        
     )
     obj_terms.append(penalty)
 
@@ -353,8 +361,7 @@ def solve_plain(bundle: ProblemBundle, values: dict, solver=cp.GUROBI, **solver_
 
 # =====================================================================================
 # PERFECT-FORESIGHT ORACLE  (deterministic; no LDR, no robust box, no tracking).
-# Free, BOUNDED bid -> can arbitrage under a signed single price, cannot under dual.
-# Bid clamped to the SAME [p_min, p_max] as the policy (fair upper bound). Gurobi (LP).
+# Bid PINNED (bid = p_d + p_ch - p_dis), matching the policy's pinned bid. Gurobi (LP).
 # =====================================================================================
 @dataclass
 class OracleBundle:
@@ -389,22 +396,25 @@ def build_oracle(fp: FixedParams, price_model: str, objective: str = "economic")
  
     p_ch  = cp.Variable(T, nonneg=True, name="p_ch")
     p_dis = cp.Variable(T, nonneg=True, name="p_dis")
-    bid   = cp.Variable(T, name="bid")                    # FREE, bounded, the arbitrage lever
- 
+
     p_d   = cp.Parameter(T, name="p_d")                   # TRUE prosumption (perfect foresight)
     pi_da = cp.Parameter(T, name="pi_da")
- 
+
+    # bid: PINNED to the true realised position (see matching note in dispatch_layer.py's
+    # build_oracle). A free bid lets the oracle arbitrage the known pi_da/pi_imb spread
+    # using only price info the policy has too -- not genuine value of knowing p_d.
+    bid = p_d + p_ch - p_dis                              # plain solve -- no DPP constraint
+
     L = np.tril(np.ones((T, T)))
     soc = fp.SOC0 + fp.dt * (L @ (fp.eta_ch * p_ch - (1.0 / fp.eta_dis) * p_dis))
     cons = [
         p_ch <= fp.C_ch, p_dis <= fp.C_dis,
         soc >= 0, soc <= fp.B_max,
         soc[T - 1] == fp.SOC0,                            # hard terminal equality
-        bid >= fp.p_min, bid <= fp.p_max,                 # SAME bounds as the policy
     ]
- 
+
     net_draw = p_d + p_ch - p_dis                         # p^g with the TRUE realisation
-    imb = net_draw - bid                                  # feeder-side: +ve = short
+    imb = net_draw - bid                                  # == 0 identically (bid pinned to net_draw)
     C_da = pi_da @ bid * fp.dt
  
     param_by_name = {"p_d": p_d, "pi_da": pi_da}
