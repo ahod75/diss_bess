@@ -89,13 +89,21 @@ def build_features(
     df: pd.DataFrame,
     prosumption_col: str = "prosumption",
     feature_cols: list[str] = ["solar_irrad", "panel_temp", "ambient_temp"],
-    price_cols: list[str] = ["da", "imb", "up_reg_cost", "down_reg_cost"]
+    price_cols: list[str] | None = None
 ) -> pd.DataFrame:
     """
     df: DatetimeIndex (hourly), columns = [load_col, *feature_cols].
     Returns a frame with the prosumption, plus calendar features (hour-of-day
     and weekday, both cyclical) and the feature columns. Cyclical encoding is used
     for hour-of-day and day-of-week, but one-hot for weekends.
+
+    price_cols defaults to None (no price columns at all) rather than a fixed list --
+    deliberately, so a caller that forgets to pass it gets a frame with NO price data
+    (loud, immediate KeyError/missing-column downstream) rather than silently getting
+    whatever the last price-column convention happened to be. A hardcoded default here
+    already caused a real bug once (evaluate.py's load_test_windows and both h-sweep
+    scripts silently pulled a stale price_cols default after the imb_up/imb_down
+    rename) -- explicit callers only, from here on.
     """
     out = pd.DataFrame(index=df.index)
     out[prosumption_col] = df[prosumption_col].astype(float)
@@ -117,8 +125,9 @@ def build_features(
     out["is_weekend"] = is_weekend
     for c in feature_cols:
         out[c] = df[c].astype(float)
-    for d in price_cols:
-        out[d] = df[d].astype(float)
+    if price_cols is not None:
+        for d in price_cols:
+            out[d] = df[d].astype(float)
 
     return out
 

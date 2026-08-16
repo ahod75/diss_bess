@@ -1,154 +1,41 @@
 from __future__ import annotations
 from dataclasses import dataclass
-import warnings
 import numpy as np
 import torch
 
-from dispatch_layer import FixedParams
+from dispatch_shared import _to_t
 
 # =====================================================================================
-# dispatch_wrapper.py  --  the realised-metric ENGINE and the input builder.
+# dispatch_wrapper.py  --  the realised-metric ENGINE, and nothing else now.
 #
-#   cholesky_of_second_moment(...) -> DIFFERENTIABLE (T,T) Cholesky factor for k=1's
-#                                     Sigma_xi_chol layer parameter (see dispatch_layer)
-#   compute_box(...)            -> frozen box half-widths from the BASELINE forecaster (B1)
-#   make_dispatch_inputs(...)   -> named param-value dict for solve_plain / the layer
 #   realised_breakdown(...)     -> the single source of truth for realised quantities
-#   realised_cost(...)          -> thin C_da + C_imb wrapper on the breakdown (DFL loss)
-#   per_day_metrics(...)        -> the seven per-day scalars
-#   money_plot_series(...)      -> arrays for the bid / p^g / p_imb / price plots
-#   regret(...)                 -> realised_cost - oracle_cost (arbitraging, price-aware)
+#   realised_cost(...)          -> thin C_da + C_imb wrapper on the breakdown (DFL loss,
+#                                   economic-objective corners)
+#   realised_imbalance(...)     -> thin dt**2 * sum_squares(p_imb) wrapper on the same
+#                                   breakdown (DFL loss, dispatchability corners)
 #
 # ALL realised quantities are post-saturation and computed against the SAME pl_hat anchor
 # the layer used (xi_real = realised - pl_hat). Free bid:  bid = pl_hat + p_da_rel.
+#
+# Everything that used to live here and wasn't this post-solve engine has moved out:
+#   - _to_t, cholesky_of_second_moment, PRICE_COLS, get_prices, oracle_price_values,
+#     compute_box -> dispatch_shared.py (pre-solve input shaping, formulation-agnostic,
+#     used identically by training and testing). _to_t is now IMPORTED from there --
+#     the dependency direction used to run the other way.
+#   - per_day_metrics -> 8_testing/evaluate.py (its only real caller; training scripts
+#     imported it but never called it, confirmed by grep before the move).
+#   - assert_price_consistency, make_dispatch_inputs, money_plot_series, regret() ->
+#     removed entirely (zero real callers anywhere in the live pipeline).
+#
+# `fp: FixedParams` used to be imported from dispatch_layer.py (now oracle.py, since
+# FixedParams was dead code there too and got removed). realised_breakdown's `fp` is
+# duck-typed across dispatch_setup.FixedParams and FixedParams1Stage -- there was never
+# one correct static type for it, so no import/annotation replaces the old one.
 # =====================================================================================
-
-_SAT_TOL = 1e-6
-
-# -------------------------------------------------------------------------------------
-# Second-moment Cholesky factor, DIFFERENTIABLE (torch.linalg.cholesky, not numpy) --
-# k=1's tracking term needs grad to flow xi -> Sigma_xi_chol -> the layer -> the
-# forecaster. An earlier version computed this via xi.detach().cpu().numpy() +
-# np.linalg.cholesky, which silently zeroed that gradient path; this is the fix.
-# M = xi^T xi / N (biased /N: matches dispatch_layer's sum_squares(R @ Sigma_xi_chol)
-# trace identity exactly for mean-centred xi). Symmetrise + jitter before Cholesky --
-# cheap insurance against intermittent non-PD M (N=64 > T=24 so generically full rank,
-# but not guaranteed).
-# -------------------------------------------------------------------------------------
-def cholesky_of_second_moment(xi: torch.Tensor, jitter: float = 1e-9) -> torch.Tensor:
-    N = xi.shape[-2]
-    M = xi.transpose(-2, -1) @ xi / N
-    M = 0.5 * (M + M.transpose(-2, -1)) + jitter * torch.eye(xi.shape[-1], dtype=xi.dtype, device=xi.device)
-    return torch.linalg.cholesky(M)   # lower L with L @ L^T == M; grad flows to xi
-
-# -------------------------------------------------------------------------------------
-# PLUG POINT: prices straight from the dataset columns (no computation in between).
-# The dataset already stores the rectified reg costs, so the max{0,.} that would
-# otherwise be an "outside the layer" step is precomputed upstream.
-#   single -> {pi_da, pi_imb}          (signed settlement price 'imb')
-#   dual   -> {pi_da, lam_up, lam_dn}  (rectified spread, already >= 0)
-# -------------------------------------------------------------------------------------
-PRICE_COLS = ("da", "imb", "up_reg_cost", "down_reg_cost")
-
-
-def get_prices(price_day, price_model, cols=PRICE_COLS):
-    """price_day: (T, 4) slice from WindowSet.price; columns in `cols` order."""
-    price_day = np.asarray(price_day, dtype=float)
-    idx = {c: i for i, c in enumerate(cols)}
-    da = price_day[..., idx["da"]]
-    if price_model == "single":
-        return {"pi_da": da, "pi_imb": price_day[..., idx["imb"]]}   # pi_imb POSITIVE; sign is in p_imb
-    if price_model == "dual":
-        return {"pi_da": da,
-                "lam_up": np.clip(price_day[..., idx["up_reg_cost"]], 0.0, None),   # clamp = insurance
-                "lam_dn": np.clip(price_day[..., idx["down_reg_cost"]], 0.0, None)}
-    raise ValueError(price_model)
-
-
-def oracle_price_values(price_day, price_model, realised, cols=PRICE_COLS):
-    """Full param dict for solve_oracle: prices + p_d = realised prosumption (perfect foresight)."""
-    d = get_prices(price_day, price_model, cols)
-    d["p_d"] = np.asarray(realised, dtype=float)
-    return d
-
-
-def assert_price_consistency(price_all, cols=PRICE_COLS, tol=1e-2):
-    """Run ONCE at load over the WHOLE dataset. Verifies the dual reg costs are the
-    rectified da-imb spread, nonneg, and complementary. If the consistency check fails,
-    up/down are independent series (not derived from imb) -- know that before framing
-    single-vs-dual as 'same prices, two settlement rules'."""
-    p = np.asarray(price_all, dtype=float).reshape(-1, len(cols))
-    idx = {c: i for i, c in enumerate(cols)}
-    da, imb = p[:, idx["da"]], p[:, idx["imb"]]
-    up, dn = p[:, idx["up_reg_cost"]], p[:, idx["down_reg_cost"]]
-    assert (up >= -tol).all() and (dn >= -tol).all(), "reg costs must be >= 0"
-    assert (np.abs(up * dn) <= tol).all(), "reg costs must be complementary (up*dn == 0)"
-    assert np.allclose(up, np.clip(imb - da, 0, None), atol=tol), "up != max(0, imb-da)"
-    assert np.allclose(dn, np.clip(da - imb, 0, None), atol=tol), "dn != max(0, da-imb)"
-
-
-def _to_t(x, like: torch.Tensor | None = None) -> torch.Tensor:
-    if isinstance(x, torch.Tensor):
-        t = x
-    else:
-        t = torch.as_tensor(np.asarray(x, dtype=np.float64))
-    if like is not None:
-        t = t.to(dtype=like.dtype, device=like.device)
-    return t
-
-
-# -------------------------------------------------------------------------------------
-# INPUT BUILDER.  pl_hat, xi, Sigma come from THIS model's quantiles; the box (h_plus,
-# h_minus) is the FROZEN baseline box (B1), passed in. Second moment is xi^T xi / N
-# (NOT torch.cov) so the k=1 tracking equals the true SAA expected-squared-imbalance.
-# Returns a NAMED dict of param values; solve_plain / order_param_values select the
-# subset this (price_model, k) problem actually declares.
-# -------------------------------------------------------------------------------------
-def make_dispatch_inputs(
-    quantiles,                 # (K, Q) THIS model's quantiles for one day (physical MW)
-    sampler,                   # FrozenCopulaSampler (mean_and_errors); S must == num_scenarios
-    price_model,               # "single" | "dual"
-    k,                         # 0 | 1
-    pi_da,                     # (T,)
-    pi_imb=None,               # (T,) SIGNED single price       (single only)
-    lam_up=None, lam_dn=None,  # (T,) >=0 dual reg costs        (dual only; computed OUTSIDE)
-    also_return_meta=False,
-):
-    if quantiles.dim() != 2:
-        raise ValueError("quantiles must be (K, Q) for a single day")
-    mean, xi = sampler.mean_and_errors(quantiles)      # mean (K,)=(T,), xi (S,K)=(N,T); grad kept
-    pl_hat = mean
-
-    vals = {
-        "pl_hat":  pl_hat,
-        "pi_da":   _to_t(pi_da,   like=xi),
-    }
-    if price_model == "single":
-        if pi_imb is None:
-            raise ValueError("single price needs pi_imb")
-        vals["pi_imb"] = _to_t(pi_imb, like=xi)
-    elif price_model == "dual":
-        if lam_up is None or lam_dn is None:
-            raise ValueError("dual price needs lam_up and lam_dn (computed outside as max{0,.})")
-        vals["xi_samples"] = xi
-        vals["lam_up"] = _to_t(lam_up, like=xi)
-        vals["lam_dn"] = _to_t(lam_dn, like=xi)
-    else:
-        raise ValueError(price_model)
-
-    if k > 0.0:
-        # k=1's tracking term needs Sigma_xi_chol, not xi_samples -- see dispatch_layer's
-        # build_problem and cholesky_of_second_moment above (differentiable: grad flows
-        # xi -> Sigma_xi_chol -> the layer -> the forecaster).
-        vals["Sigma_xi_chol"] = cholesky_of_second_moment(xi)
-
-    if also_return_meta:
-        return vals, {"pl_hat": pl_hat, "xi": xi}
-    return vals
 
 
 # =====================================================================================
-# THE ENGINE.  One realised solve -> everything the metrics and money plot need.
+# THE ENGINE.  One realised solve -> everything the metrics need.
 # Runs in torch (serves the differentiable DFL loss AND the detached test path). At test,
 # pass numpy decisions; _to_t lifts them (grad-free) and the reductions return floats.
 # =====================================================================================
@@ -171,12 +58,12 @@ class RealisedBreakdown:
 # This is unecessary for testing, but it makes it simpler to keep it all as one function.
 # Makes it slightly slower, but keeps it simpler and neater.
 def realised_breakdown(
-    fp: FixedParams,
+    fp,   # duck-typed: dispatch_setup.FixedParams or FixedParams1Stage, never checked by type
     p_ch_hat, p_dis_hat, D_ch, D_dis, p_da_rel,   # the 5 decisions from the layer / solve
     realised,                                      # (T,) realised prosumption for the day
     pl_hat,                                        # (T,) SAME anchor the layer used
     price_model,                                   # "single" | "dual"
-    pi_da, pi_imb=None, lam_up=None, lam_dn=None,
+    pi_da, pi_imb=None, pi_imb_up=None, pi_imb_down=None,
     clip_recourse=True,                            # test: True; correctness gate uses False
 ) -> RealisedBreakdown:
     p_ch_hat = torch.as_tensor(p_ch_hat) if isinstance(p_ch_hat, torch.Tensor) \
@@ -192,12 +79,12 @@ def realised_breakdown(
 
     xi_real = realised - pl_hat                                    # [B, 24]
     bid = pl_hat + p_da_rel                                        # [B, 24]
-    
+
     # 1. Expand xi_real to [B, 24, 1] for batched matrix multiplication
     xi_real_col = xi_real.unsqueeze(-1)
-    
+
     # 2. D_ch @ xi_real_col yields [B, 24, 1]. Squeeze returns it to [B, 24]
-    p_ch_raw  = p_ch_hat  + (D_ch  @ xi_real_col).squeeze(-1)      
+    p_ch_raw  = p_ch_hat  + (D_ch  @ xi_real_col).squeeze(-1)
     p_dis_raw = p_dis_hat + (D_dis @ xi_real_col).squeeze(-1)
 
     if clip_recourse:
@@ -228,7 +115,7 @@ def realised_breakdown(
 
     ## Now accurate vectors have been produced, can aggregate them to realised values.
     p_g = realised + p_ch_r - p_dis_r                             # realised grid draw
-    p_imb = p_g - bid                                            # = imb_det + R xi_real (in-box)
+    p_imb = p_g - bid                # = (deterministic imbalance, always 0 -- pinned bid) + R xi_real (in-box)
 
     C_da = (pi_da * bid).sum(dim=-1) * dt                              # includes pi_da . pl_hat (add-back)
 
@@ -238,11 +125,11 @@ def realised_breakdown(
             raise ValueError("single needs pi_imb")
         C_imb = (_to_t(pi_imb, like=p_ch_hat) * p_imb).sum(dim=-1) * dt          # signed
     elif price_model == "dual":
-        if lam_up is None or lam_dn is None:
-            raise ValueError("dual needs lam_up, lam_dn")
-        lu = _to_t(lam_up, like=p_ch_hat); ld = _to_t(lam_dn, like=p_ch_hat)
-        C_imb = (lu * torch.clamp(p_imb, min=0.0)
-                 + ld * torch.clamp(-p_imb, min=0.0)).sum(dim=-1) * dt          # >= 0
+        if pi_imb_up is None or pi_imb_down is None:
+            raise ValueError("dual needs pi_imb_up, pi_imb_down")
+        pi_up = _to_t(pi_imb_up, like=p_ch_hat); pi_down = _to_t(pi_imb_down, like=p_ch_hat)
+        C_imb = (pi_up * torch.clamp(p_imb, min=0.0)
+                 + pi_down * torch.clamp(-p_imb, min=0.0)).sum(dim=-1) * dt          # >= 0
     else:
         raise ValueError(price_model)
 
@@ -259,69 +146,17 @@ def realised_cost(fp, *args, **kwargs) -> torch.Tensor:
     return bd.C_da + bd.C_imb
 
 
-# -------------------------------------------------------------------------------------
-# THE SEVEN PER-DAY SCALARS (reductions over one breakdown).  Saturation is combined
-# charge+discharge (per decision). oracle_cost is precomputed per (day, price_model).
-# -------------------------------------------------------------------------------------
-def per_day_metrics(fp: FixedParams, bd: RealisedBreakdown, oracle_cost: float) -> dict:
-    dt = fp.dt
-    total_cost = float(bd.C_da + bd.C_imb)
-    clip_ch  = torch.abs(bd.p_ch_raw  - bd.p_ch_r)
-    clip_dis = torch.abs(bd.p_dis_raw - bd.p_dis_r)
-    sat_hours = int(((clip_ch > _SAT_TOL) | (clip_dis > _SAT_TOL)).sum().item())
-    sat_MWh   = float(((clip_ch + clip_dis) * dt).sum().item())
-    return {
-        "total_cost":     total_cost,                                  # 1
-        "regret":         total_cost - float(oracle_cost),             # 2
-        "abs_dev_MWh":    float((torch.abs(bd.p_imb) * dt).sum().item()),  # 3
-        "C_da":           float(bd.C_da.item()),                       # 4a  (DA/IMB split...
-        "C_imb":          float(bd.C_imb.item()),                      # 4b   ...sums to total_cost)
-        "sat_hours":      sat_hours,                                   # 5
-        "sat_MWh":        sat_MWh,                                     # 6
-        "throughput_MWh": float(((bd.p_ch_r + bd.p_dis_r) * dt).sum().item()),  # 7 (grid-side)
-    }
+def realised_imbalance(fp, *args, **kwargs) -> torch.Tensor:
+    """Dispatchability-mode DFL-loss wrapper: realised tracking error on the SAME
+    breakdown the test metrics use, in the SAME units as dispatch_objectives'
+    dispatchability solve objective (dt**2 * sum_squares(imb)) -- so the post-solve
+    training signal matches what the layer itself optimised for at decision time.
 
-
-# -------------------------------------------------------------------------------------
-# MONEY-PLOT SERIES (per representative day). The bid/p^g gap (bid is now pinned to
-# pl_hat + p_ch_hat - p_dis_hat, not bounded arbitrage) is the single-vs-dual story;
-# the price panel is what makes the bid behaviour readable.
-# -------------------------------------------------------------------------------------
-def money_plot_series(fp, bd: RealisedBreakdown, price_model,
-                      pi_da, pi_imb=None, lam_up=None, lam_dn=None) -> dict:
-    to_np = lambda t: t.detach().cpu().numpy()
-    out = {
-        "bid":    to_np(bd.bid),
-        "p_g":    to_np(bd.p_g),          # realised grid draw (post-saturation)
-        "p_imb":  to_np(bd.p_imb),
-        "soc":    to_np(bd.soc),
-        "p_ch_r": to_np(bd.p_ch_r),
-        "p_dis_r": to_np(bd.p_dis_r),
-        "pi_da":  np.asarray(pi_da, float),
-    }
-    if price_model == "single":
-        out["pi_imb"] = np.asarray(pi_imb, float)
-    else:
-        out["lam_up"] = np.asarray(lam_up, float)
-        out["lam_dn"] = np.asarray(lam_dn, float)
-    return out
-
-
-# -------------------------------------------------------------------------------------
-# REGRET (corrected oracle caller: arbitraging, price-aware, bid-clamped in build_oracle).
-# oracle_solve is the closure from dispatch_layer.solve_oracle wrapped per price_model.
-# The oracle term is detached (perfect foresight) -> grad(regret) == grad(realised_cost).
-# -------------------------------------------------------------------------------------
-def regret(
-    fp, p_ch_hat, p_dis_hat, D_ch, D_dis, p_da_rel,
-    realised, pl_hat, price_model, oracle_cost,
-    pi_da, pi_imb=None, lam_up=None, lam_dn=None,
-    clip_recourse=True,
-) -> torch.Tensor:
-    cost = realised_cost(
-        fp, p_ch_hat, p_dis_hat, D_ch, D_dis, p_da_rel,
-        realised, pl_hat, price_model,
-        pi_da=pi_da, pi_imb=pi_imb, lam_up=lam_up, lam_dn=lam_dn,
-        clip_recourse=clip_recourse,
-    )
-    return cost - float(oracle_cost)      # oracle_cost precomputed & detached upstream
+    Takes the identical call signature as realised_cost (including price_model/pi_da/
+    pi_imb[_up/_down]) even though dispatchability is price-agnostic and only p_imb is
+    used below -- there is no dummy/omitted-price special case here. The caller already
+    has the TRUE prices on hand for the economic corners' realised_cost call at this same
+    site, so passing them through costs nothing extra, and C_da/C_imb are simply computed
+    and discarded rather than adding a second, price-optional code path to maintain."""
+    bd = realised_breakdown(fp, *args, **kwargs)
+    return fp.dt ** 2 * (bd.p_imb ** 2).sum(dim=-1)
