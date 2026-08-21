@@ -37,7 +37,7 @@ MODES_1STAGE = ("single-price", "dual-price")
 # place (see dispatch_shared.Variables1Stage, which has no R field at all).
 #
 # No deterministic-offset argument here: point-robust, full-robust, and 1-stage all pin
-# the bid, so the deterministic imbalance p_ch_hat - p_dis_hat - p_da_rel is always 0
+# the bid, so the deterministic imbalance p_ch_hat - p_dis_hat - p_da_bat is always 0
 # (see dispatch_shared.Variables' docstring -- removed entirely as a field rather than
 # carried as an always-zero one), and imb_scen is purely R @ xi_samples.T (or
 # xi_samples.T itself, with no R). If some future formulation ever leaves the bid free,
@@ -75,7 +75,17 @@ def _build_dual_price_epigraph(fp, R=None):
 
     imb_scen = (R @ xi_samples.T) if R is not None else xi_samples.T   # (T, N)
     epigraph_cons = [p_plus - p_minus == imb_scen]
-    C_imb = cp.sum(pi_imb_up @ p_plus + pi_imb_down @ p_minus) * dt / N
+    # Net (standard two-price) settlement, matching dispatch_wrapper.realised_breakdown's
+    # identical fix: short (imb>0) pays pi_up, long (imb<0) is CREDITED at pi_down, not
+    # charged again. Still DPP-compliant and bounded -- p_plus/p_minus stay pure
+    # Parameter-free Variables (only p_plus-p_minus is tied to the parameter-bearing
+    # imb_scen, via the equality constraint above, not by direct multiplication), and
+    # substituting that equality in shows the effective coefficient on the free variable
+    # p_minus is (pi_imb_up - pi_imb_down) >= 0 always (pi_imb_up = max(da,imb) >=
+    # min(da,imb) = pi_imb_down by construction) -- bounded below, minimized at the
+    # natural non-negative split p_plus=(imb)+, p_minus=(imb)-, same mechanism as
+    # before, just yielding the net rather than the gross value there.
+    C_imb = cp.sum(pi_imb_up @ p_plus - pi_imb_down @ p_minus) * dt / N
 
     params = [xi_samples, pi_imb_up, pi_imb_down]
     return C_imb, epigraph_cons, params
@@ -100,12 +110,12 @@ def build_objective_2stage(fp, mode: str, v: Variables):
     if mode in ("single-price", "dual-price"):
         pi_da = cp.Parameter(T, name="pi_da")
         params.append(pi_da)
-        C_da = pi_da @ v.p_da_rel * dt   # DA constant pi_da.pl_hat.dt dropped -- added back downstream
+        C_da = pi_da @ v.p_da_bat * dt   # DA constant pi_da.pl_hat.dt dropped -- added back downstream
 
         if mode == "single-price":
             # E[pi_imb . p_imb] = pi_imb . (deterministic imbalance) = 0: the R.xi term
             # vanishes in expectation (E[xi]=0), and the deterministic imbalance
-            # p_ch_hat - p_dis_hat - p_da_rel is 0 by the pinned bid -- so C_imb is
+            # p_ch_hat - p_dis_hat - p_da_bat is 0 by the pinned bid.  C_imb is
             # identically 0 regardless of pi_imb's value, and pi_imb is never declared
             # as a Parameter here at all (nothing left for it to multiply). Settlement
             # still needs the real pi_imb value -- that's realised_breakdown's job, a
@@ -117,14 +127,7 @@ def build_objective_2stage(fp, mode: str, v: Variables):
             params += dual_params
 
         obj_terms.append(C_da + C_imb)
-
-    else:  # dispatchability
-        Sigma_xi_chol = cp.Parameter((T, T), name="Sigma_xi_chol")
-        params.append(Sigma_xi_chol)
-        sum_trace = dt**2 * cp.sum_squares(v.R @ Sigma_xi_chol)   # deterministic-offset term dropped -- always 0, pinned bid
-        obj_terms.append(sum_trace)
-
-    # ---- PENALTY (always) -----------------------------------------------------------
+    # ---- PENALTY (always present, though set to 0 for evaluation) -----------------------
     penalty = fp.gamma * (
         cp.sum_squares(v.p_ch_hat) + cp.sum_squares(v.p_dis_hat)
         + cp.sum_squares(v.D_ch) + cp.sum_squares(v.D_dis)
@@ -158,11 +161,11 @@ def build_objective_1stage(fp, mode: str, v: Variables1Stage):
 
     pi_da = cp.Parameter(T, name="pi_da")
     params.append(pi_da)
-    C_da = pi_da @ v.p_da_rel * dt
+    C_da = pi_da @ v.p_da_bat * dt
 
     if mode == "single-price":
         # SIGNED settlement -- exact, no epigraph needed: the deterministic imbalance
-        # p_ch_hat - p_dis_hat - p_da_rel is a plain (T,) vector here, no scenario/xi
+        # p_ch_hat - p_dis_hat - p_da_bat is a plain (T,) vector here, no scenario/xi
         # term to average over (unlike the 2-stage case, where this identity only holds
         # in EXPECTATION over xi) -- and it's 0 by the pinned bid, so C_imb is
         # identically 0 regardless of pi_imb's value; pi_imb is never declared as a
@@ -175,6 +178,6 @@ def build_objective_1stage(fp, mode: str, v: Variables1Stage):
         params += dual_params
 
     penalty = fp.gamma * (cp.sum_squares(v.p_ch_hat) + cp.sum_squares(v.p_dis_hat)
-                           + cp.sum_squares(v.p_da_rel))
+                           + cp.sum_squares(v.p_da_bat))
 
     return C_da + C_imb + penalty, params, epigraph_cons

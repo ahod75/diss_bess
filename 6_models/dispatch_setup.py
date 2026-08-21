@@ -89,96 +89,11 @@ def default_fixed_params_1stage(num_scenarios: int = 64, gamma: float = 1e-4) ->
 
 
 # =====================================================================================
-# POINT-ROBUST -- feasibility checked at exactly 3 literal points of xi: {0, h_plus,
-# -h_minus}. NOT equivalent to exact robustness over the box -- see the full-robust
-# setup's docstring for why. Cheap heuristic: 2 literal constraint blocks, no dual
-# variables. p_da_rel is a plain expression here (not a Variable), so the deterministic
-# imbalance p_ch_hat - p_dis_hat - p_da_rel is the literal zero expression with no
-# equality constraint needed to force it -- removed from Variables entirely rather
-# than carried as an always-zero field (see Variables' docstring in dispatch_shared.py).
-# =====================================================================================
-def setup_point_robust(fp: FixedParams, mode: str) -> ProblemBundle:
-    T, dt = fp.T_total, fp.dt
-
-    p_ch_hat  = cp.Variable(T, name="p_ch_hat")
-    p_dis_hat = cp.Variable(T, name="p_dis_hat")
-    D_ch      = cp.Variable((T, T), name="D_ch")
-    D_dis     = cp.Variable((T, T), name="D_dis")
-
-    # LDR non-anticipativity via a MASK, not an equality constraint: cp.upper_tri(D)==0
-    # costs 2*T*(T-1)/2 equality rows in the KKT system; since the Tikhonov penalty
-    # (dispatch_objectives.py) applies to the RAW D_ch/D_dis, any nonzero
-    # upper-triangular entry only ever costs without benefiting anything, so the solver
-    # drives those entries to exactly 0 unassisted.
-    tril_mask = np.tril(np.ones((T, T)))
-    D_ch_eff  = cp.multiply(tril_mask, D_ch)
-    D_dis_eff = cp.multiply(tril_mask, D_dis)
-
-    # bid: PINNED, as a plain expression -- DPP-safe wherever it's used (Parameter @
-    # variable-only-expression). pl_hat is NOT a cvxpy Parameter anywhere in this
-    # problem; it cannot affect the argmin, so it only matters downstream.
-    p_da_rel = p_ch_hat - p_dis_hat
-    R        = np.eye(T) + D_ch_eff - D_dis_eff         # (T,T) net recourse matrix
-
-    power_flow_hat = fp.eta_ch * p_ch_hat - (1.0 / fp.eta_dis) * p_dis_hat
-    s_hat = fp.SOC0 + dt * cp.cumsum(power_flow_hat)               # (T,) nominal SOC
-    D_net = fp.eta_ch * D_ch_eff - (1.0 / fp.eta_dis) * D_dis_eff
-    G = dt * cp.cumsum(D_net, axis=0)                              # (T,T) recourse SOC gain
-
-    h_plus  = cp.Parameter(T, nonneg=True, name="h_plus")
-    h_minus = cp.Parameter(T, nonneg=True, name="h_minus")
-
-    v = Variables(
-        p_ch_hat=p_ch_hat, p_dis_hat=p_dis_hat, D_ch=D_ch, D_dis=D_dis,
-        D_ch_eff=D_ch_eff, D_dis_eff=D_dis_eff,
-        p_da_rel=p_da_rel, R=R,
-        s_hat=s_hat, G=G, h_plus=h_plus, h_minus=h_minus,
-    )
-
-    cons = []
-    # nominal (xi=0) feasibility
-    cons += [p_ch_hat >= 0, p_ch_hat <= fp.C_ch]
-    cons += [p_dis_hat >= 0, p_dis_hat <= fp.C_dis]
-    cons += [s_hat >= 0, s_hat <= fp.B_max]
-    cons += [
-        s_hat[T - 1] == fp.SOC0,
-        G[T - 1, :] == 0,          # recourse energy-neutral at T -- exact for ANY xi
-    ]
-    # point feasibility at the box edges (Variable @ Parameter, DPP-safe, no duals)
-    for xi_i in (h_plus, -h_minus):
-        p_ch_i  = p_ch_hat  + D_ch_eff  @ xi_i
-        p_dis_i = p_dis_hat + D_dis_eff @ xi_i
-        soc_i   = s_hat + G @ xi_i
-        cons += [
-            p_ch_i >= 0, p_ch_i <= fp.C_ch,
-            p_dis_i >= 0, p_dis_i <= fp.C_dis,
-            soc_i >= 0, soc_i <= fp.B_max,
-        ]
-
-    obj, obj_params, epigraph_cons = build_objective_2stage(fp, mode, v)
-    cons += epigraph_cons
-    params = obj_params + [h_plus, h_minus]
-
-    prob = cp.Problem(cp.Minimize(obj), cons)
-    assert prob.is_dcp(dpp=True), "not DPP -- cvxpylayers will reject"
-
-    variables = [p_ch_hat, p_dis_hat, D_ch, D_dis]
-    return ProblemBundle(
-        problem=prob,
-        params=params,
-        variables=variables,
-        param_by_name={p.name(): p for p in params},
-        var_by_name={var.name(): var for var in variables},
-        mode=mode,
-    )
-
-
-# =====================================================================================
 # FULL-ROBUST -- exact robustness over the whole box {xi : -h_minus <= xi <= h_plus},
 # via LP duality (robustify_vec) -- 12 extra (T,T) dual-variable blocks (6 calls, 2
 # blocks each), vs. point-robust's 2 literal constraint blocks and zero duals.
 #
-# p_da_rel is a genuine cp.Variable, pinned via an equality constraint, and D_ch/D_dis's
+# p_da_bat is a genuine cp.Variable, pinned via an equality constraint, and D_ch/D_dis's
 # lower-triangular shape is enforced via cp.upper_tri(.)==0 rather than a mask -- both
 # flagged elsewhere as removable-but-not-yet-removed relative to point-robust's
 # simplifications. Faithful to the deployed models_robust/dispatch_layer_robust.py, not
@@ -208,12 +123,12 @@ def setup_full_robust(fp: FixedParams, mode: str) -> ProblemBundle:
     p_dis_hat = cp.Variable(T, name="p_dis_hat")
     D_ch      = cp.Variable((T, T), name="D_ch")
     D_dis     = cp.Variable((T, T), name="D_dis")
-    p_da_rel  = cp.Variable(T, name="p_da_rel")
+    p_da_bat  = cp.Variable(T, name="p_da_bat")
 
     cons = [
         cp.upper_tri(D_ch) == 0,
         cp.upper_tri(D_dis) == 0,
-        p_da_rel == p_ch_hat - p_dis_hat,     # PIN the bid
+        p_da_bat == p_ch_hat - p_dis_hat,     # PIN the bid
     ]
 
     D_ch_eff, D_dis_eff = D_ch, D_dis         # already triangular once the above holds
@@ -230,7 +145,7 @@ def setup_full_robust(fp: FixedParams, mode: str) -> ProblemBundle:
     v = Variables(
         p_ch_hat=p_ch_hat, p_dis_hat=p_dis_hat, D_ch=D_ch, D_dis=D_dis,
         D_ch_eff=D_ch_eff, D_dis_eff=D_dis_eff,
-        p_da_rel=p_da_rel, R=R,
+        p_da_bat=p_da_bat, R=R,
         s_hat=s_hat, G=G, h_plus=h_plus, h_minus=h_minus,
     )
 
@@ -252,9 +167,9 @@ def setup_full_robust(fp: FixedParams, mode: str) -> ProblemBundle:
     prob = cp.Problem(cp.Minimize(obj), cons)
     assert prob.is_dcp(dpp=True), "not DPP -- cvxpylayers will reject"
 
-    # p_da_rel IS a layer output here (a real Variable), unlike point-robust where it's
+    # p_da_bat IS a layer output here (a real Variable), unlike point-robust where it's
     # a plain expression reconstructed downstream.
-    variables = [p_ch_hat, p_dis_hat, D_ch, D_dis, p_da_rel]
+    variables = [p_ch_hat, p_dis_hat, D_ch, D_dis, p_da_bat]
     return ProblemBundle(
         problem=prob,
         params=params,
@@ -267,7 +182,7 @@ def setup_full_robust(fp: FixedParams, mode: str) -> ProblemBundle:
 
 # =====================================================================================
 # 1-STAGE -- no D_ch/D_dis, no R, no G, no box -- there is no recourse mechanism at
-# all, so nothing here needs a box-relative (xi) coordinate. p_da_rel is kept as a
+# all, so nothing here needs a box-relative (xi) coordinate. p_da_bat is kept as a
 # pure-variable DPP stand-in for (p_da - pl_hat), pinned via an equality constraint,
 # matching the same not-yet-simplified pattern as full-robust's.
 # =====================================================================================
@@ -276,14 +191,14 @@ def setup_1stage(fp: FixedParams1Stage, mode: str) -> ProblemBundle:
 
     p_ch_hat  = cp.Variable(T, name="p_ch_hat")
     p_dis_hat = cp.Variable(T, name="p_dis_hat")
-    p_da_rel  = cp.Variable(T, name="p_da_rel")
+    p_da_bat  = cp.Variable(T, name="p_da_bat")
 
-    cons = [p_da_rel == p_ch_hat - p_dis_hat]   # PIN the bid
+    cons = [p_da_bat == p_ch_hat - p_dis_hat]   # PIN the bid
 
     power_flow_hat = fp.eta_ch * p_ch_hat - (1.0 / fp.eta_dis) * p_dis_hat
     s_hat = fp.SOC0 + dt * cp.cumsum(power_flow_hat)
 
-    v = Variables1Stage(p_ch_hat=p_ch_hat, p_dis_hat=p_dis_hat, p_da_rel=p_da_rel,
+    v = Variables1Stage(p_ch_hat=p_ch_hat, p_dis_hat=p_dis_hat, p_da_bat=p_da_bat,
                          s_hat=s_hat)
 
     cons += [
@@ -299,7 +214,7 @@ def setup_1stage(fp: FixedParams1Stage, mode: str) -> ProblemBundle:
     prob = cp.Problem(cp.Minimize(obj), cons)
     assert prob.is_dcp(dpp=True), "not DPP -- cvxpylayers will reject"
 
-    variables = [p_ch_hat, p_dis_hat, p_da_rel]
+    variables = [p_ch_hat, p_dis_hat, p_da_bat]
     return ProblemBundle(
         problem=prob,
         params=obj_params,

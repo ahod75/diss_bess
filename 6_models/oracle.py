@@ -145,16 +145,16 @@ def oracle_realised_cost(fp, bundle: OracleBundle, decision_price_values: dict, 
     solve_oracle's own objective value would benchmark the policy against an oracle that
     saw a DIFFERENT (clipped/proxy) day-ahead price than it actually settles at --
     exactly the apples-to-oranges mismatch dispatch_wrapper.py warns about for the
-    policy side. p_da_rel/D_ch/D_dis are reconstructed the same way a genuinely
+    policy side. p_da_bat/D_ch/D_dis are reconstructed the same way a genuinely
     recourse-free decision would be (bid pinned, zero recourse) since the oracle itself
     has no D_ch/D_dis mechanism to report."""
     _, dec = solve_oracle(bundle, decision_price_values, solver=solver,
                           return_decisions=True, **solver_kwargs)
     p_ch, p_dis = dec["p_ch"], dec["p_dis"]
-    p_da_rel = p_ch - p_dis
+    p_da_bat = p_ch - p_dis
     D_zero = np.zeros((fp.T_total, fp.T_total))
     cost = realised_cost(
-        fp, p_ch, p_dis, D_zero, D_zero, p_da_rel,
+        fp, p_ch, p_dis, D_zero, D_zero, p_da_bat,
         realised=realised, pl_hat=realised, price_model=price_model,
         pi_da=true_pi_da, pi_imb=true_pi_imb,
         pi_imb_up=true_pi_imb_up, pi_imb_down=true_pi_imb_down,

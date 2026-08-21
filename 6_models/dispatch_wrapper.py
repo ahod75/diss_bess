@@ -15,7 +15,7 @@ from dispatch_shared import _to_t
 #                                   breakdown (DFL loss, dispatchability corners)
 #
 # ALL realised quantities are post-saturation and computed against the SAME pl_hat anchor
-# the layer used (xi_real = realised - pl_hat). Free bid:  bid = pl_hat + p_da_rel.
+# the layer used (xi_real = realised - pl_hat). Free bid:  bid = pl_hat + p_da_bat.
 #
 # Everything that used to live here and wasn't this post-solve engine has moved out:
 #   - _to_t, cholesky_of_second_moment, PRICE_COLS, get_prices, oracle_price_values,
@@ -46,7 +46,7 @@ class RealisedBreakdown:
     p_ch_r:    torch.Tensor   # (T,) realised charge  (post-saturation)
     p_dis_r:   torch.Tensor   # (T,) realised discharge (post-saturation)
     soc:       torch.Tensor   # (T,) realised SOC trajectory (post-action)
-    bid:       torch.Tensor   # (T,) committed DA bid = pl_hat + p_da_rel
+    bid:       torch.Tensor   # (T,) committed DA bid = pl_hat + p_da_bat
     p_g:       torch.Tensor   # (T,) realised grid draw = realised + p_ch_r - p_dis_r
     p_imb:     torch.Tensor   # (T,) realised imbalance = p_g - bid
     C_da:      torch.Tensor   # scalar
@@ -59,26 +59,27 @@ class RealisedBreakdown:
 # Makes it slightly slower, but keeps it simpler and neater.
 def realised_breakdown(
     fp,   # duck-typed: dispatch_setup.FixedParams or FixedParams1Stage, never checked by type
-    p_ch_hat, p_dis_hat, D_ch, D_dis, p_da_rel,   # the 5 decisions from the layer / solve
+    p_ch_hat, p_dis_hat, D_ch, D_dis, p_da_bat,    # the 5 decisions from the layer / solve
     realised,                                      # (T,) realised prosumption for the day
     pl_hat,                                        # (T,) SAME anchor the layer used
     price_model,                                   # "single" | "dual"
     pi_da, pi_imb=None, pi_imb_up=None, pi_imb_down=None,
     clip_recourse=True,                            # test: True; correctness gate uses False
 ) -> RealisedBreakdown:
+    
     p_ch_hat = torch.as_tensor(p_ch_hat) if isinstance(p_ch_hat, torch.Tensor) \
            else torch.as_tensor(np.asarray(p_ch_hat, np.float64))
     p_dis_hat = _to_t(p_dis_hat, like=p_ch_hat)
     D_ch      = _to_t(D_ch, like=p_ch_hat)
     D_dis = _to_t(D_dis, like=p_ch_hat)
-    p_da_rel  = _to_t(p_da_rel, like=p_ch_hat)
+    p_da_bat  = _to_t(p_da_bat, like=p_ch_hat)
     realised  = _to_t(realised,  like=p_ch_hat)
     pl_hat    = _to_t(pl_hat,    like=p_ch_hat)
     pi_da     = _to_t(pi_da,     like=p_ch_hat)
     T, dt = fp.T_total, fp.dt
 
     xi_real = realised - pl_hat                                    # [B, 24]
-    bid = pl_hat + p_da_rel                                        # [B, 24]
+    bid = pl_hat + p_da_bat                                        # [B, 24]
 
     # 1. Expand xi_real to [B, 24, 1] for batched matrix multiplication
     xi_real_col = xi_real.unsqueeze(-1)
@@ -88,49 +89,78 @@ def realised_breakdown(
     p_dis_raw = p_dis_hat + (D_dis @ xi_real_col).squeeze(-1)
 
     if clip_recourse:
-        # Stratigakos-like state-dependent saturation. SOC headroom caps carry /dt (dt-correct).
+        # State-dependent saturation. SOC headroom caps carry /dt (dt-correct).
         soc = _to_t(fp.SOC0, like=p_ch_hat)
         ch_list, dis_list, soc_list = [], [], []
         C_ch  = _to_t(fp.C_ch,  like=p_ch_hat)
         C_dis = _to_t(fp.C_dis, like=p_ch_hat)
         B_max = _to_t(fp.B_max, like=p_ch_hat)
+
+        # used to ensure non-negativity
         z = _to_t(0.0, like=p_ch_hat)
 
-        ## This runs for every time-step of the day, to ensure accurate tracking of battery SOC.
+        ## This runs for every time-step of the day, to ensure accurate tracking of battery SOC
+        # and no impossible charge/discharge actions.
         for t in range(T):
+            # Saturation block: max rate of charge/discharge constraints 
             max_ch  = torch.minimum(C_ch,  (B_max - soc) / (fp.eta_ch * dt))
             max_dis = torch.minimum(C_dis, (soc * fp.eta_dis) / dt)
-            pc = torch.clamp(torch.minimum(torch.clamp(p_ch_raw[..., t],  min=z), torch.clamp(max_ch,  min=z)), min=z)
-            pd = torch.clamp(torch.minimum(torch.clamp(p_dis_raw[..., t], min=z), torch.clamp(max_dis, min=z)), min=z)
-            soc = soc + dt * (fp.eta_ch * pc - (1.0 / fp.eta_dis) * pd)
-            ch_list.append(pc); dis_list.append(pd); soc_list.append(soc)
+
+            # saturaion block actions:
+            # ensures non-negativity of  p_ch, p_dis (incase raw values are negative,
+            # though they should't be).
+            # either p_ch_raw is smaller than max_ch and gets passed through,
+            # or max_ch is smaller, in which case the saturation block acts.
+            p_ch = torch.clamp(torch.minimum(p_ch_raw[..., t], max_ch), min=z)
+            p_dis = torch.clamp(torch.minimum(p_dis_raw[..., t], max_dis), min=z)
+
+            # SOC equation
+            soc = soc + dt * (fp.eta_ch * p_ch - (1.0 / fp.eta_dis) * p_dis)
+
+            # builds list over (T-1, from 1 to 23) of charge, discharge actions and SOC. 
+            ch_list.append(p_ch)
+            dis_list.append(p_dis)
+            soc_list.append(soc)
+
+        # Use stack to handle batches if being batch-run.
         p_ch_r  = torch.stack(ch_list, dim = -1)
         p_dis_r = torch.stack(dis_list, dim = -1)
         soc_traj = torch.stack(soc_list, dim = -1)
     else:
         # no-clip: realised = raw; SOC from raw actions (used only for the in-box gate).
+        # (never actually used but still nice to have)
         p_ch_r, p_dis_r = p_ch_raw, p_dis_raw
         net = fp.eta_ch * p_ch_r - (1.0 / fp.eta_dis) * p_dis_r
         soc_traj = fp.SOC0 + dt * torch.cumsum(net, dim=-1)
 
-    ## Now accurate vectors have been produced, can aggregate them to realised values.
-    p_g = realised + p_ch_r - p_dis_r                             # realised grid draw
-    p_imb = p_g - bid                # = (deterministic imbalance, always 0 -- pinned bid) + R xi_real (in-box)
+    ## Now accurate vectors have been produced, can recombine 
+    #  aggregate them to realised values.
+    p_g = realised + p_ch_r - p_dis_r # realised grid draw
+    p_imb = p_g - bid                 # realised imbalance (total draw - DA bid)
 
-    C_da = (pi_da * bid).sum(dim=-1) * dt                              # includes pi_da . pl_hat (add-back)
 
+    ## Work out costs.
+    C_da = (pi_da * bid).sum(dim=-1) * dt # includes pi_da . pl_hat (added back in)
+    # again, dim=-1 used to allow batching. 
 
     if price_model == "single":
         if pi_imb is None:
             raise ValueError("single needs pi_imb")
+        ## C_imb = pi_imb * p_imb for all t in T
         C_imb = (_to_t(pi_imb, like=p_ch_hat) * p_imb).sum(dim=-1) * dt          # signed
     elif price_model == "dual":
         if pi_imb_up is None or pi_imb_down is None:
             raise ValueError("dual needs pi_imb_up, pi_imb_down")
-        pi_up = _to_t(pi_imb_up, like=p_ch_hat); pi_down = _to_t(pi_imb_down, like=p_ch_hat)
+        ## C_imb = pi_imb_up * (p_imb)^+ + pi_imb_down * (p_imb)^-
+        pi_up = _to_t(pi_imb_up, like=p_ch_hat)
+        pi_down = _to_t(pi_imb_down, like=p_ch_hat)
         C_imb = (pi_up * torch.clamp(p_imb, min=0.0)
-                 + pi_down * torch.clamp(-p_imb, min=0.0)).sum(dim=-1) * dt          # >= 0
+                 - pi_down * torch.clamp(-p_imb, min=0.0)).sum(dim=-1) * dt      # signed:
+        # short (p_imb>0) pays pi_up; long (p_imb<0) is CREDITED at pi_down, not
+        # charged again -- standard two-price (SBP/SSP-style) net settlement. Collapses
+        # exactly to the single-price formula pi_imb*p_imb when pi_up==pi_down.
     else:
+        # if price_model not given single or dual:
         raise ValueError(price_model)
 
     return RealisedBreakdown(
@@ -144,19 +174,3 @@ def realised_cost(fp, *args, **kwargs) -> torch.Tensor:
     test metrics use (so training loss and reported cost cannot drift)."""
     bd = realised_breakdown(fp, *args, **kwargs)
     return bd.C_da + bd.C_imb
-
-
-def realised_imbalance(fp, *args, **kwargs) -> torch.Tensor:
-    """Dispatchability-mode DFL-loss wrapper: realised tracking error on the SAME
-    breakdown the test metrics use, in the SAME units as dispatch_objectives'
-    dispatchability solve objective (dt**2 * sum_squares(imb)) -- so the post-solve
-    training signal matches what the layer itself optimised for at decision time.
-
-    Takes the identical call signature as realised_cost (including price_model/pi_da/
-    pi_imb[_up/_down]) even though dispatchability is price-agnostic and only p_imb is
-    used below -- there is no dummy/omitted-price special case here. The caller already
-    has the TRUE prices on hand for the economic corners' realised_cost call at this same
-    site, so passing them through costs nothing extra, and C_da/C_imb are simply computed
-    and discarded rather than adding a second, price-optional code path to maintain."""
-    bd = realised_breakdown(fp, *args, **kwargs)
-    return fp.dt ** 2 * (bd.p_imb ** 2).sum(dim=-1)

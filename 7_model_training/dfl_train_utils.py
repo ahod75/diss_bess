@@ -1,15 +1,22 @@
-"""dfl_train_utils.py -- every helper function/constant shared by ALL DFL training runs,
-regardless of architecture (point_robust | 1stage) or mode (single-price | dual-price |
-dispatchability). train_dfl_models.py is the only thing that calls into this file; this
-file has no __main__ of its own and runs nothing on import besides its own top-level
-constant/Parameter-tensor setup.
+"""dfl_train_utils.py -- every helper function/constant shared by ALL DFL training runs.
+Only architecture=="1stage" is supported now (point_robust training was removed
+entirely, not merged in here -- see dispatch_setup.py's module comment; evaluation still
+uses setup_full_robust directly, unaffected by this). Modes: single-price | dual-price
+(NOT dispatchability -- setup_1stage/build_objective_1stage raise on it, no recourse
+mechanism to build a tracking term from). train_dfl_forecasts.py is the only thing that
+calls into this file (formerly train_dfl_models.py, retired -- see
+train_dfl_forecasts.py's own docstring for why "balanced" was folded into its archetype
+grid instead of kept separate); this file has no __main__ of its own and runs nothing on
+import besides its own top-level constant/Parameter-tensor setup.
 
 Split out of the former train_corner.py (single-corner CLI script, now removed) once
-train_dfl_models.py took over running every corner in one process -- everything that
-used to live in train_corner.py's module body EXCEPT its __main__ block lives here
-unchanged. See train_dfl_models.py's module docstring for why all-corners-in-one-process
-was chosen over one-subprocess-per-corner (the previous run_all_corners.py, also
-removed), and how it manages the memory-isolation tradeoff that comes with it.
+the former train_dfl_models.py took over running every corner in one process --
+everything that used to live in train_corner.py's module body EXCEPT its __main__ block
+lives here unchanged. All-corners-in-one-process was chosen over one-subprocess-per-corner
+(the even older run_all_corners.py, also removed) for the shared-data speedup (training
+data/baseline model loaded once instead of once per corner) at the cost of losing true
+process isolation -- see train_dfl_forecasts.py's per-corner try/except + gc.collect for
+how that tradeoff is managed now.
 
 ORACLE REMOVED from training entirely (was: f_dfl = clamp(raw_cost - oracle_cost, 0)).
 Now: economic modes (single-price/dual-price) train directly on
@@ -53,14 +60,10 @@ from forecasting import (reindex_and_impute, build_features, make_windows,
                          TRAIN_START, VAL_START, TEST_START,
                          HIST_COLS, FEAT_COLS, EXO_COLS)
 from copula_lib import FrozenCopulaSampler
-from dispatch_setup import (default_fixed_params, default_fixed_params_1stage,
-                             setup_point_robust, setup_1stage)
-from dispatch_shared import (make_layer, compute_box, get_prices, select_fc_columns,
+from dispatch_setup import default_fixed_params_1stage, setup_1stage
+from dispatch_shared import (make_layer, get_prices, select_fc_columns,
                               cholesky_of_second_moment, price_model_for_settlement, build_layer_vals)
 from dispatch_wrapper import realised_breakdown
-
-ARCHITECTURES = ("point_robust", "1stage")
-MODES = ("single-price", "dual-price", "dispatchability")
 
 PRICE_COLS = ["da", "imb", "imb_up", "imb_down"]
 PRICE_COLS_FC = ["da_fc", "imb_fc", "imb_up_fc", "imb_down_fc"]   # all 4 real, always->=0 columns
@@ -69,7 +72,6 @@ ISSUE_HOUR, HORIZON, N_HIST = 9, 24, 168
 device = torch.device("cpu")
 
 GAMMA = 1e-4
-BOX_LEVELS = (0.15, 0.85)   # locked in from h_selection_sweep.ipynb -- point_robust only
 TRAIN_SOLVER = "ECOS"
 QUANTILE_LEVELS_TENSOR = torch.as_tensor(QUANTILE_LEVELS, dtype=torch.float32, device=device)
 EPS_BALANCE = 1e-6
@@ -114,22 +116,21 @@ def self_balanced_loss(L_base, f_dfl, eps=EPS_BALANCE):
 
 
 def _combine_loss(dec, realised_s, mean_s, prices_s, q_norm_s, y_true_s, *,
-            architecture, mode, fp, T, price_model_str):
+            mode, fp, T, price_model_str):
     """Turns one solved decision into (self_balanced loss, L_base, f_dfl, sat_h) --
     pulled out of dfl_loss_batch as its own top-level function (it was a nested closure
-    there, capturing architecture/mode/fp/T/price_model_str from the enclosing scope;
-    now takes them as explicit keyword args instead). Still only ever called from
-    dfl_loss_batch's two solve paths (whole-batch, and the per-day fallback), never
-    directly -- the leading underscore stays to signal that."""
+    there, capturing mode/fp/T/price_model_str from the enclosing scope; now takes them
+    as explicit keyword args instead). Still only ever called from dfl_loss_batch's two
+    solve paths (whole-batch, and the per-day fallback), never directly -- the leading
+    underscore stays to signal that.
+
+    1stage only -- no recourse, so D_ch/D_dis are zero (structural no-op in
+    realised_breakdown)."""
     L_base = pinball_per_day(y_true_s, q_norm_s, QUANTILE_LEVELS_TENSOR)
-    if architecture == "point_robust":
-        p_ch_hat, p_dis_hat, D_ch, D_dis = dec
-        p_da_rel = p_ch_hat - p_dis_hat   # reconstructed -- not a layer output (evicted for speed)
-    else:  # 1stage -- no recourse, D_ch/D_dis are zero (structural no-op in realised_breakdown)
-        p_ch_hat, p_dis_hat, p_da_rel = dec
-        D_ch = torch.zeros((p_ch_hat.shape[0], T, T), dtype=p_ch_hat.dtype, device=p_ch_hat.device)
-        D_dis = D_ch
-    bd = realised_breakdown(fp, p_ch_hat, p_dis_hat, D_ch, D_dis, p_da_rel,
+    p_ch_hat, p_dis_hat, p_da_bat = dec
+    D_ch = torch.zeros((p_ch_hat.shape[0], T, T), dtype=p_ch_hat.dtype, device=p_ch_hat.device)
+    D_dis = D_ch
+    bd = realised_breakdown(fp, p_ch_hat, p_dis_hat, D_ch, D_dis, p_da_bat,
                             realised=realised_s, pl_hat=mean_s, price_model=price_model_str,
                             clip_recourse=True, **prices_s)
     if mode == "dispatchability":
@@ -165,42 +166,23 @@ def cvxpylayers_solver_error():
 
 
 def make_fp(architecture: str, gamma: float):
-    if architecture == "point_robust":
-        return default_fixed_params(gamma=gamma)
     if architecture == "1stage":
         return default_fixed_params_1stage(gamma=gamma)
-    raise ValueError(architecture)
+    raise ValueError(f"only 'architecture'==\"1stage\" is supported -- got {architecture!r} "
+                      f"(point_robust training was removed; evaluation still uses "
+                      f"setup_full_robust directly, not this function)")
 
 
 def make_bundle(architecture: str, fp, mode: str):
-    if architecture == "point_robust":
-        return setup_point_robust(fp, mode)
     if architecture == "1stage":
         return setup_1stage(fp, mode)
-    raise ValueError(architecture)
-
-
-def precompute_boxes(windows, baseline_model, sc, sampler, quantile_levels, device, fwd):
-    """FROZEN baseline box (B1), computed ONCE per day from the frozen baseline
-    forecaster -- never recomputed from the model currently being trained. point_robust
-    only -- 1stage has no h_plus/h_minus Parameters to feed."""
-    boxes = []
-    baseline_model.eval()
-    with torch.no_grad():
-        for d in range(len(windows.delivery_start)):
-            xh = fwd["normalise_hist"](np.asarray(windows.x_hist[d]), sc)
-            xh = torch.as_tensor(xh, dtype=torch.float32, device=device).unsqueeze(0)
-            xf = fwd["normalise_exo"](np.asarray(windows.x_fut[d]), sc)
-            xf = torch.as_tensor(xf, dtype=torch.float32, device=device).unsqueeze(0)
-            q_norm = baseline_model(xh, xf)
-            q_phys = fwd["denormalise_y"](q_norm, sc).squeeze(0).to(torch.float64)
-            h_plus, h_minus = compute_box(q_phys, sampler, quantile_levels, box_levels=BOX_LEVELS)
-            boxes.append((h_plus.detach().cpu().numpy(), h_minus.detach().cpu().numpy()))
-    return boxes
+    raise ValueError(f"only 'architecture'==\"1stage\" is supported -- got {architecture!r} "
+                      f"(point_robust training was removed; evaluation still uses "
+                      f"setup_full_robust directly, not this function)")
 
 
 def dfl_loss_batch(batch_indices, *, model, fp, sampler, sc, windows, layer, keys,
-                   architecture, mode, device, fwd, boxes=None):
+                   mode, device, fwd):
     realised  = np.asarray(windows.y[batch_indices], float)
     price_day = np.asarray(windows.price[batch_indices], float)
     x_hist = windows.x_hist[batch_indices]
@@ -218,10 +200,8 @@ def dfl_loss_batch(batch_indices, *, model, fp, sampler, sc, windows, layer, key
     xi = torch.stack(xi_list, dim=0)
     q_norm_batch = torch.stack(q_norm_list, dim=0)
 
+    # 1stage has no h_plus/h_minus Parameters at all -- always None.
     h_plus = h_minus = None
-    if architecture == "point_robust":
-        h_plus = torch.stack([torch.as_tensor(boxes[d][0], dtype=mean.dtype, device=device) for d in batch_indices])
-        h_minus = torch.stack([torch.as_tensor(boxes[d][1], dtype=mean.dtype, device=device) for d in batch_indices])
 
     price_model_str = price_model_for_settlement(mode)
 
@@ -251,7 +231,7 @@ def dfl_loss_batch(batch_indices, *, model, fp, sampler, sc, windows, layer, key
         dec, inaccurate = solve_with_retry(layer, args)
         t_forward = time.perf_counter() - t0
         per_day, L_base, f_dfl, sat_h = _combine_loss(dec, realised, mean, true_prices_t, q_norm_batch, y_true_norm,
-                                                 architecture=architecture, mode=mode, fp=fp, T=T,
+                                                 mode=mode, fp=fp, T=T,
                                                  price_model_str=price_model_str)
         return (per_day.sum(), B, sat_h, B * T,
                 float(L_base.sum()), float(f_dfl.sum()), (B if inaccurate else 0), t_forward)
@@ -274,7 +254,7 @@ def dfl_loss_batch(batch_indices, *, model, fp, sampler, sc, windows, layer, key
         prices_i = {kk: v[i:i + 1] for kk, v in true_prices_t.items()}
         loss_i, L_base_i, f_dfl_i, sat_i = _combine_loss(dec_i, realised[i:i + 1], mean[i:i + 1], prices_i,
                           q_norm_batch[i:i + 1], y_true_norm[i:i + 1],
-                          architecture=architecture, mode=mode, fp=fp, T=T, price_model_str=price_model_str)
+                          mode=mode, fp=fp, T=T, price_model_str=price_model_str)
         total = total + loss_i.sum()
         L_base_total += float(L_base_i.sum()); f_dfl_total += float(f_dfl_i.sum())
         sat_total += sat_i
@@ -284,8 +264,7 @@ def dfl_loss_batch(batch_indices, *, model, fp, sampler, sc, windows, layer, key
     return total, n_survived, sat_total, n_survived * T, L_base_total, f_dfl_total, n_inaccurate, t_forward_total
 
 
-def evaluate_regret(*, model, fp, sampler, sc, windows, boxes, layer, keys,
-                    architecture, mode, device, fwd):
+def evaluate_regret(*, model, fp, sampler, sc, windows, layer, keys, mode, device, fwd):
     model.eval()
     tot_combined = 0.0; tot_fsurr = 0.0; tot_base = 0.0; n_ok = 0; n_skipped = 0
     tot_sat_h = 0; tot_n_h = 0; tot_inaccurate = 0; tot_t_forward = 0.0
@@ -294,8 +273,7 @@ def evaluate_regret(*, model, fp, sampler, sc, windows, boxes, layer, keys,
             try:
                 combined, n_survived, sat_h, n_h, L_base_sum, f_dfl_sum, n_inaccurate, t_forward = dfl_loss_batch(
                     [d], model=model, fp=fp, sampler=sampler, sc=sc, windows=windows,
-                    layer=layer, keys=keys, architecture=architecture, mode=mode, device=device,
-                    fwd=fwd, boxes=boxes)
+                    layer=layer, keys=keys, mode=mode, device=device, fwd=fwd)
             except RuntimeError:
                 n_skipped += 1
                 continue
@@ -309,7 +287,7 @@ def evaluate_regret(*, model, fp, sampler, sc, windows, boxes, layer, keys,
 
 
 def train_one_config(cfg: TrainConfig, *, model, fp, sampler, sc, train_windows, val_windows,
-                     boxes_train=None, boxes_val=None, device, fwd, out_path=None):
+                     device, fwd, out_path=None):
     torch.manual_seed(cfg.seed)
     bundle = make_bundle(cfg.architecture, fp, cfg.mode)
     layer = make_layer(bundle)
@@ -333,8 +311,7 @@ def train_one_config(cfg: TrainConfig, *, model, fp, sampler, sc, train_windows,
                 batch_loss, n_survived, sat_h, n_h, _, _, n_inaccurate, t_forward = dfl_loss_batch(
                     batch.tolist(), model=model, fp=fp, sampler=sampler, sc=sc,
                     windows=train_windows, layer=layer, keys=keys,
-                    architecture=cfg.architecture, mode=cfg.mode, device=device,
-                    fwd=fwd, boxes=boxes_train)
+                    mode=cfg.mode, device=device, fwd=fwd)
             except RuntimeError as e:
                 print(f"  SKIPPING whole batch (start={start}): {e}")
                 continue
@@ -351,8 +328,7 @@ def train_one_config(cfg: TrainConfig, *, model, fp, sampler, sc, train_windows,
 
         val_combined, val_fsurr, val_base, n_skipped, val_sat_frac, val_inaccurate, val_t_forward = evaluate_regret(
             model=model, fp=fp, sampler=sampler, sc=sc, windows=val_windows,
-            boxes=boxes_val, layer=layer, keys=keys,
-            architecture=cfg.architecture, mode=cfg.mode, device=device, fwd=fwd)
+            layer=layer, keys=keys, mode=cfg.mode, device=device, fwd=fwd)
         grad_norms_arr = np.asarray(grad_norms) if grad_norms else np.asarray([0.0])
         train_sat_frac = sat_hours_epoch / n_hours_epoch if n_hours_epoch > 0 else 0.0
         history.append({"val_combined": val_combined, "val_fsurr": val_fsurr,

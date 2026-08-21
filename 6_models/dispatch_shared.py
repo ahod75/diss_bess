@@ -30,6 +30,11 @@ from cvxpylayers.torch import CvxpyLayer
 
 
 def _to_t(x, like: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Converts input to torch tensor, optionally matching device and
+    dtype of input to reference tensor. Especially useful to ensure
+    gradient can flow through back to forecaster for realised_breakdown. 
+    """
     if isinstance(x, torch.Tensor):
         t = x
     else:
@@ -181,7 +186,7 @@ class Variables:
     never how it was made feasible.
 
     No imb_det field: it was always provably 0 (identically for point-robust's plain-
-    expression p_da_rel, or enforced by full-robust's pinning equality constraint) in
+    expression p_da_bat, or enforced by full-robust's pinning equality constraint) in
     every place it was used (single-price's C_imb, dispatchability's sum_trace), so it
     contributed nothing to any objective value, argmin, or gradient -- removed rather
     than kept as an always-zero term. See dispatch_objectives.py's module docstring for
@@ -193,7 +198,7 @@ class Variables:
     D_dis:     cp.Variable      # (T,T) RAW (pre-mask, or already-triangular for full-robust)
     D_ch_eff:  cp.Expression    # (T,T) lower-triangular / non-anticipative
     D_dis_eff: cp.Expression    # (T,T) lower-triangular / non-anticipative
-    p_da_rel:  cp.Expression    # (T,) PINNED bid-minus-pl_hat (plain expr. or a pinned Variable)
+    p_da_bat:  cp.Expression    # (T,) PINNED bid-minus-pl_hat (plain expr. or a pinned Variable)
     R:         np.ndarray       # (T,T) net recourse matrix I + D_ch_eff - D_dis_eff
     s_hat:     cp.Expression    # (T,) nominal (xi=0) SOC trajectory
     G:         cp.Expression    # (T,T) recourse SOC-gain matrix
@@ -211,7 +216,7 @@ class Variables1Stage:
     provably 0 here too, enforced by setup_1stage's pinning equality constraint)."""
     p_ch_hat:  cp.Variable      # (T,)
     p_dis_hat: cp.Variable      # (T,)
-    p_da_rel:  cp.Variable      # (T,) PINNED via an equality constraint (see setup_1stage)
+    p_da_bat:  cp.Variable      # (T,) PINNED via an equality constraint (see setup_1stage)
     s_hat:     cp.Expression    # (T,) SOC trajectory -- fully deterministic, no recourse term
 
 
