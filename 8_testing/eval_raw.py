@@ -124,12 +124,28 @@ SAT_TOL = 1e-6
 # Which forecaster_ids are valid under each price_mode -- the price-mode firewall lives
 # in this data structure's shape, not in a runtime check (see module docstring).
 # forecaster_id -> checkpoint file is f"{forecaster_id}.pt" in 7_model_training/, except
-# "baseline" which loads baseline_forecaster_best.pt instead.
+# "baseline" which loads baseline_forecaster_best.pt instead. Balanced-only now (the
+# short_sharp/long_slow specialist checkpoints were retired along with the archetype
+# grid -- see train_dfl_forecasts.py's docstring); ARCHETYPES (imported below) shrinking
+# to one entry means the archetype loop this feeds is now degenerate too.
+# "crps_only_retrained" (see train_crps_only.py) is the missing control: baseline weights
+# fine-tuned on pinball loss ALONE, no economic term -- same training budget as every DFL
+# corner, isolating how much of DFL's benefit is just "more training" vs the task loss
+# specifically. Price-mode-independent (pinball never touches price), so it appears under
+# both keys, same as "baseline".
+# SEED_VARIANTS: seed-averaging campaign (9_analysis/why_dfl_helps.md Section 7) --
+# baseline is deliberately NOT seed-averaged (out of scope, by request); crps_only and
+# both DFL modes are, at these 4 extra seeds plus the original 20240801 (already covered
+# by the unsuffixed names above) for N=5 total per model type. Naming matches
+# train_crps_only.py/train_dfl_forecasts.py's own "_seed{N}" convention exactly.
+SEED_VARIANTS = [20240802, 20240803, 20240804, 20240805]
 FORECASTERS = {
-    "single-price": ["baseline", "dfl_1stage_single-price",
-                      "dfl_1stage_single-price_short_sharp", "dfl_1stage_single-price_long_slow"],
-    "dual-price":   ["baseline", "dfl_1stage_dual-price",
-                      "dfl_1stage_dual-price_short_sharp", "dfl_1stage_dual-price_long_slow"],
+    "single-price": (["baseline", "crps_only_retrained", "dfl_1stage_single-price"]
+                      + [f"crps_only_retrained_seed{s}" for s in SEED_VARIANTS]
+                      + [f"dfl_1stage_single-price_seed{s}" for s in SEED_VARIANTS]),
+    "dual-price":   (["baseline", "crps_only_retrained", "dfl_1stage_dual-price"]
+                      + [f"crps_only_retrained_seed{s}" for s in SEED_VARIANTS]
+                      + [f"dfl_1stage_dual-price_seed{s}" for s in SEED_VARIANTS]),
 }
 
 

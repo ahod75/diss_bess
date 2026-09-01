@@ -84,9 +84,9 @@ class TrainConfig:
     architecture: str
     mode: str
     lr: float = 5e-4
-    batch_size: int = 8
-    max_epochs: int = 20
-    patience: int = 5
+    batch_size: int = 64
+    max_epochs: int = 200
+    patience: int = 10
     grad_clip: float = 3.0
     seed: int = 20240801
 
@@ -289,7 +289,27 @@ def evaluate_regret(*, model, fp, sampler, sc, windows, layer, keys, mode, devic
 def train_one_config(cfg: TrainConfig, *, model, fp, sampler, sc, train_windows, val_windows,
                      device, fwd, out_path=None):
     torch.manual_seed(cfg.seed)
-    bundle = make_bundle(cfg.architecture, fp, cfg.mode)
+    np.random.seed(cfg.seed)
+    # DECISION bundle is always built as single-price, even when cfg.mode=="dual-price".
+    # For 1-stage, dual-price's epigraph (p_plus/p_minus/xi_samples,
+    # dispatch_objectives._build_dual_price_epigraph) is additively separable from the
+    # battery decision variables: build_objective_1stage returns C_da(battery) +
+    # C_imb(epigraph) + penalty(battery), and the epigraph's only constraint,
+    # p_plus-p_minus==xi_samples.T, never references p_ch_hat/p_dis_hat/p_da_bat/s_hat --
+    # verified directly against dispatch_objectives.py, not assumed. No shared
+    # constraint + a separable objective means the KKT system is block-diagonal, so
+    # cvxpylayers' implicit differentiation gives IDENTICAL forward decisions AND
+    # gradients for the battery variables whether or not the epigraph is included
+    # (already verified empirically too -- dual_price_gradient_mechanism.md's
+    # single-vs-dual decision comparison differs by ~1e-9, solver noise only). f_dfl
+    # itself never touches the epigraph either: realised_breakdown takes only the
+    # battery decision + true prices. So the epigraph is provably inert for training --
+    # building the decision LP without it changes nothing except solve/backward cost,
+    # which is exactly the point: dual-price's LP scales with num_scenarios=64 for no
+    # training-relevant reason. Mode-specific behaviour (which settlement formula
+    # f_dfl uses) is entirely preserved below via cfg.mode, untouched by this.
+    decision_mode = "single-price" if cfg.architecture == "1stage" else cfg.mode
+    bundle = make_bundle(cfg.architecture, fp, decision_mode)
     layer = make_layer(bundle)
     keys = [p.name() for p in bundle.params]
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)

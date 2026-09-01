@@ -1,35 +1,34 @@
-"""train_dfl_forecasts.py -- trains 1stage single-price/dual-price forecasters under
-battery archetypes that vary the POWER/ENERGY RATIO (duration = B_max/C_ch), not just
-overall capacity scale: short_sharp (high power, low energy -- fast reaction, little
-buffer), balanced (the original default, C_ch=C_dis=2.0/B_max=4.0/duration=2h), and
-long_slow (low power, high energy -- slow reaction, lots of buffer).
+"""train_dfl_forecasts.py -- trains 1stage single-price/dual-price forecasters for the
+balanced battery archetype (C_ch=C_dis=2.0MW, B_max=4.0MWh, duration=2h).
 
 This is now the ONLY DFL training entry point -- train_dfl_models.py (which trained
 point_robust's single-price/dispatchability/dual-price corners plus 1stage's "balanced"
-pair) has been retired entirely; "balanced" was folded in here as the third archetype
-grid point rather than kept as a separate script. Its checkpoints deliberately keep the
-UNSUFFIXED dfl_1stage_{mode}.pt naming train_dfl_models.py used (not
-dfl_1stage_{mode}_balanced.pt) -- evaluate.py and every archetype-comparison script
-written this session already look up checkpoints by that exact unsuffixed name, so
-renaming it would silently break every one of them.
+pair) has been retired entirely. Checkpoints keep the UNSUFFIXED dfl_1stage_{mode}.pt
+naming train_dfl_models.py used -- every evaluation/analysis script looks up checkpoints
+by that exact unsuffixed name.
 
-Only 1stage architecture is covered. Justification: a same-session pilot compared the
-TRAINING gradient (setup_1stage, one forward+backward pass from the identical frozen
-baseline weights) across archetypes for both modes and found comparable, non-trivial
-divergence (single-price: cos_sim 0.992-0.997, rel_L2_dist 12-21%; dual-price: cos_sim
-~0.993, rel_L2_dist 13-17%) -- both modes showed enough gradient-level sensitivity to
-battery shape to justify a real retrain-per-archetype, not just single-price or just
-dual-price. point_robust/dispatchability are out of scope for this grid, consistent with
-the broader pivot toward 1stage-only training (point_robust training was removed
-entirely, not merged in here -- see dispatch_setup.py's module comment).
+Only 1stage architecture is covered, and only the balanced archetype -- the earlier
+short_sharp/long_slow archetype grid (and the pilot that motivated retraining per
+archetype) was dropped when the project narrowed to a balanced-only, single-vs-dual-price
+comparison; see git history for that pilot's findings if the archetype-sensitivity
+rationale is ever needed again. point_robust/dispatchability are out of scope for this
+grid, consistent with the broader pivot toward 1stage-only training (point_robust
+training was removed entirely, not merged in here -- see dispatch_setup.py's module
+comment).
 
 Loads data once, per-corner try/except, gc.collect after every corner, forward/backward
 timing -- no box precomputation at all, since 1stage has no h_plus/h_minus Parameters to
 feed regardless of archetype.
 
-Usage: python train_dfl_forecasts.py
+Usage: python train_dfl_forecasts.py [--seed SEED]
+Seed 20240801 (TrainConfig's default) writes the unsuffixed dfl_1stage_{mode}.pt names
+every other consumer (eval_raw.FORECASTERS, aggregate_results.ipynb,
+forecast_characteristics.ipynb) already expects. Any other seed writes
+dfl_1stage_{mode}_seed{SEED}.pt alongside them -- used for seed-averaging, see
+9_analysis/why_dfl_helps.md Section 7.
 """
 from __future__ import annotations
+import argparse
 import gc
 import time
 import pickle
@@ -53,15 +52,13 @@ LOG_DIR.mkdir(exist_ok=True)
 
 MODES = ["single-price", "dual-price"]
 
-# (name, C_ch, C_dis, B_max) -- SOC0 derived as 0.5*B_max. "balanced" is the original
-# default (formerly trained by the now-retired train_dfl_models.py) -- its checkpoint
-# path is special-cased below to stay unsuffixed (dfl_1stage_{mode}.pt), matching every
-# existing consumer's expectation.
+# (name, C_ch, C_dis, B_max) -- SOC0 derived as 0.5*B_max. Balanced-only now (short_sharp/
+# long_slow dropped -- see module docstring); kept as a single-element list rather than
+# hardcoded scalars so eval_raw.py's `from train_dfl_forecasts import ARCHETYPES` import
+# (its "single source of truth" for archetype physical params) keeps working unchanged.
 #               columns: charge rate (MW), discharge rate (MW), capacity (MWh)
-ARCHETYPES = [   
-    ("short_sharp", 4.0, 4.0, 2.0),
-    ("balanced",    2.0, 2.0, 4.0),
-    ("long_slow",   1.0, 1.0, 8.0),
+ARCHETYPES = [
+    ("balanced", 2.0, 2.0, 4.0),
 ]
 
 
@@ -82,8 +79,16 @@ def load_data():
     return train_windows, val_windows
 
 
+DEFAULT_SEED = 20240801  # matches TrainConfig's own default
+
+
 def main():
-    print(f"device={device}  archetypes={ARCHETYPES}  modes={MODES}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    args = parser.parse_args()
+    seed = args.seed
+
+    print(f"device={device}  archetypes={ARCHETYPES}  modes={MODES}  seed={seed}")
 
     print("loading training data (once, shared across every corner)...")
     train_windows, val_windows = load_data()
@@ -110,13 +115,16 @@ def main():
                 model = model.to(device)
 
                 fp = make_fp(C_ch, C_dis, B_max)
-                cfg = TrainConfig(architecture="1stage", mode=mode)
+                cfg = TrainConfig(architecture="1stage", mode=mode, seed=seed)
                 print(f"batch_size={cfg.batch_size}")
-                # "balanced" keeps the unsuffixed name every existing consumer expects
-                # (evaluate.py, archetype comparison scripts) -- only the two named
-                # archetype variants get a suffix.
-                suffix = "" if arch_name == "balanced" else f"_{arch_name}"
-                out_path = DFL_TRAIN_DIR / f"dfl_1stage_{mode}{suffix}.pt"
+                # unsuffixed name every consumer expects when arch is balanced (the only
+                # one left) and seed is the project default; ARCHETYPES being
+                # balanced-only is kept as a conditional only so re-adding an archetype
+                # later doesn't silently clobber the balanced checkpoint. Non-default
+                # seeds get a _seed{N} suffix -- see module docstring, seed-averaging.
+                arch_suffix = "" if arch_name == "balanced" else f"_{arch_name}"
+                seed_suffix = "" if seed == DEFAULT_SEED else f"_seed{seed}"
+                out_path = DFL_TRAIN_DIR / f"dfl_1stage_{mode}{arch_suffix}{seed_suffix}.pt"
 
                 trained_model, best_val, hist = train_one_config(
                     cfg, model=model, fp=fp, sampler=sampler, sc=sc,
